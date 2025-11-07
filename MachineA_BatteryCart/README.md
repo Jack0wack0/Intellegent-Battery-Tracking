@@ -21,12 +21,21 @@ This component is part of an intelligent battery tracking system designed to mon
 
 ## Installation
 
-1. Clone this repository to your Raspberry Pi. Do this by running the following commands:
-git clone --no-checkout https://github.com/Jack0wack0/Intellegent-Battery-Tracking.git
-cd Intellegent-Battery-Tracking
-git sparse-checkout init --cone
-git sparse-checkout set MachineA_BatteryCart Shared
-git checkout main
+1. Clone this repository to your Raspberry Pi using sparse checkout (this downloads only the necessary components):
+   ```bash
+   # Clone the repository without downloading files yet
+   git clone --no-checkout https://github.com/Jack0wack0/Intellegent-Battery-Tracking.git
+   
+   # Move into the repository directory
+   cd Intellegent-Battery-Tracking
+   
+   # Set up sparse checkout to only download required folders
+   git sparse-checkout init --cone
+   git sparse-checkout set MachineA_BatteryCart Shared
+   
+   # Download the specified folders
+   git checkout main
+   ```
 
 2. Create a `.env` file in the project directory with the following content:
    ```

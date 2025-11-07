@@ -1,0 +1,9 @@
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+python-dotenv
+
+# Notes:
+# - `dslogtocsvlibrary` is included in this repository (local), so it is not required from PyPI.
+# - If you want pinned versions, replace the package names above with specific versions (e.g. pkg==1.2.3).

@@ -1,0 +1,27 @@
+client_secret_541159939474-tn4skdqgfl8ki85ad8qedn1cludb323r.apps.googleusercontent.com.json
+2025_03_20 12_30_25 Thu.dslog
+exclusionListFP.txt
+__pycache__/dslogstream.cpython-311.pyc
+csvDSLogs/2025_03_20 12_30_25 Thu.csv
+dslogtocsvlibrary/__pycache__/__init__.cpython-311.pyc
+dslogtocsvlibrary/__pycache__/dseventstream.cpython-311.pyc
+dslogtocsvlibrary/__pycache__/dslogstream.cpython-311.pyc
+
+dslogtocsvlibrary/entry/__pycache__/event_entry.cpython-311.pyc
+dslogtocsvlibrary/entry/__pycache__/__init__.cpython-311.pyc
+dslogtocsvlibrary/entry/__pycache__/generic_entry.cpython-311.pyc
+dslogtocsvlibrary/entry/__pycache__/log_entry.cpython-311.pyc
+dslogtocsvlibrary/entry/__pycache__/metadata.cpython-311.pyc
+dslogtocsvlibrary/entry/__pycache__/parse_date.cpython-311.pyc
+dslogtocsvlibrary/entry/__pycache__/pdp_ctre_data.cpython-311.pyc
+dslogtocsvlibrary/entry/__pycache__/pdp_data.cpython-311.pyc
+dslogtocsvlibrary/entry/__pycache__/pdp_meta_data.cpython-311.pyc
+dslogtocsvlibrary/entry/__pycache__/pdp_rev_pdh_data.cpython-311.pyc
+dslogtocsvlibrary/entry/__pycache__/pdp_type.cpython-311.pyc
+dslogtocsvlibrary/entry/__pycache__/status_entry.cpython-311.pyc
+.env
+token.pickle
+filtered_output.csv
+csvDSLogs/*
+__pycache__/*
+temp/*

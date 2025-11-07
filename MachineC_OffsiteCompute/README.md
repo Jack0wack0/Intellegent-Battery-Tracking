@@ -59,25 +59,37 @@ Notes:
 
 ## Installation (recommended)
 
-1. Create a Python virtual environment and activate it:
+There is an installer script that handles the common setup tasks: creating a virtualenv, installing Python dependencies (from `requirements.txt`), creating a minimal `.env` template, optionally installing Tailscale, and creating systemd units to run the services automatically.
+
+Run the installer:
+
+```bash
+cd MachineC_OffsiteCompute
+chmod +x install.sh
+./install.sh
+```
+
+What the installer does
+- Creates a virtualenv at `MachineC_OffsiteCompute/venv` and installs packages from `requirements.txt` (or falls back to a reasonable default set).
+- Creates a minimal `.env` template in the MachineC folder if you don't already have one; edit it with the paths and values for `GOOGLE_CREDS_PATH`, `GOOGLE_TOKEN_PATH`, `DRIVE_FOLDER_NAME`, and `LOCAL_STORAGE_PATH`.
+- Optionally installs Tailscale and can bring it up with an auth key if you provide one during the installer prompt.
+- Creates and enables these systemd units:
+	- `offsite-firebase-scraper.service` — long-running service that runs `FirebaseScraper.py` continuously.
+	- `offsite-check.service` — a oneshot service that runs `check_and_run_main.py` (the wrapper that only runs `main.py` when new Drive files are detected).
+	- `offsite-check.timer` — a systemd timer that triggers `offsite-check.service` every 10 minutes and once shortly after boot.
+
+Manual alternative
+If you prefer not to run the installer, you can still set things up manually:
 
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-```
-
-2. Install required packages (recommended):
-
-```bash
 pip install --upgrade pip
 pip install -r requirements.txt
+# create creds/ and place your credentials.json per .env variables
 ```
 
-If you prefer pinned versions, edit `requirements.txt` to include specific versions (e.g. `pkg==1.2.3`).
-
-3. Place your Google OAuth `credentials.json` at the path you specified in `GOOGLE_CREDS_PATH` (e.g. `creds/credentials.json`).
-
-4. Create the `.env` file in this folder (see the section above). Ensure `LOCAL_STORAGE_PATH` exists or change it to a valid path.
+Then run the components manually as needed (see sections below).
 
 ## First run and authentication
 
@@ -94,13 +106,27 @@ source venv/bin/activate   # if using virtualenv
 python3 main.py
 ```
 
+If you used `install.sh`, the installer created a venv at `venv/`. To test the Drive-check wrapper without waiting for the timer, run:
+
+```bash
+source venv/bin/activate
+python3 check_and_run_main.py
+```
+
+That will authenticate if necessary and only run `main.py` when there are Drive files that are not yet in `exclusionListFP.txt`.
+
 ## Running automatically (suggested)
 
-You can run `main.py` as a cron job or systemd service. Example systemd unit (place in `/etc/systemd/system/offsite-compute.service`):
+We provide an installer which creates systemd units for two purposes:
+
+- `offsite-firebase-scraper.service` — runs `FirebaseScraper.py` continuously as a service.
+- `offsite-check.service` + `offsite-check.timer` — the timer triggers every 10 minutes (and once shortly after boot) to run `check_and_run_main.py`. The wrapper checks Drive for new `.dslog`/`.dsevents` files and runs `main.py` only when new files are found (i.e. files not already listed in `exclusionListFP.txt`).
+
+If you prefer a single long-running service for `main.py` instead of a timer, you can create your own systemd unit similar to the example below and enable it instead of the timer:
 
 ```
 [Unit]
-Description=Offsite DSLog processor
+Description=Offsite DSLog processor (manual long-running)
 After=network.target
 
 [Service]
@@ -114,7 +140,7 @@ EnvironmentFile=/home/pi/Intellegent-Battery-Tracking/MachineC_OffsiteCompute/.e
 WantedBy=multi-user.target
 ```
 
-Adjust the `User`, `WorkingDirectory`, `ExecStart`, and `EnvironmentFile` paths to match your setup.
+Adjust `User`, `WorkingDirectory`, and `ExecStart` to match your installation paths.
 
 ## Output directories
 
@@ -128,5 +154,20 @@ Adjust the `User`, `WorkingDirectory`, `ExecStart`, and `EnvironmentFile` paths 
 - Headless auth: perform the auth flow on a desktop and copy `token.pickle` to the Pi's `GOOGLE_TOKEN_PATH`.
 - Permission errors when copying: ensure `LOCAL_STORAGE_PATH` is writable by the user running the script.
 - DSLog parsing errors: `DSConverter.py` uses the local `dslogtocsvlibrary` to parse binary logs. If parsing fails, check the stack trace printed by `DSConverter.py` and the `exclusionListFP.txt` to see which files were skipped.
+
+Service & timer troubleshooting
+- Check the FirebaseScraper logs:
+	- `sudo journalctl -u offsite-firebase-scraper.service -f`
+- Check the check service logs (oneshot runs):
+	- `sudo journalctl -u offsite-check.service --since "1 hour ago"`
+- Timer status:
+	- `systemctl list-timers --all | grep offsite-check`
+
+If you need to run the Drive-check manually (for testing):
+
+```bash
+source venv/bin/activate
+python3 check_and_run_main.py
+```
 
 ---

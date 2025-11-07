@@ -81,6 +81,7 @@ void loop() {
     int state = val > threshold ? 1 : 0;
     if (state != lastState[i]) {
       lastState[i] = state;
+      delay(500); // the arduinos are too fast. listener function listens to usb inputs before arduinos, which means if this delay doesnt exist the whole program breaks.
       Serial.print("SLOT_");
       Serial.print(i);
       Serial.print(":");

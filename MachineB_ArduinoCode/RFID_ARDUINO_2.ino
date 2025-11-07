@@ -18,7 +18,8 @@ void loop() {
     int currentState = val > threshold ? 1 : 0;
 
     if (currentState != lastState[i]) { //output if the state is different.
-      lastState[i] = currentState; 
+      lastState[i] = currentState;
+      delay(500); // if you are wondering what this is here for, dont touch it and read the comment in RFID_ARDUINO_1 
       Serial.print("SLOT_");
       Serial.print(i+6); //added +6 for the 2nd arduino.
       Serial.print(":");

@@ -37,15 +37,20 @@ This component is part of an intelligent battery tracking system designed to mon
    git checkout main
    ```
 
-2. Create a `.env` file in the project directory with the following content:
-   ```
-   FIREBASE_DB_BASE_URL=your-firebase-url
+2. Firebase credentials and `.env` file
+
+   The included `install.sh` script will prompt you for the Firebase Realtime Database URL and the full path to your Firebase service account JSON file, and it will create a `.env` file for you in the project directory during installation.
+
+   If you prefer to create the `.env` file manually, create a file named `.env` in the project directory with the following contents (replace the placeholders):
+
+   ```bash
+   FIREBASE_DB_BASE_URL=https://your-project.firebaseio.com
    FIREBASE_CREDS_FILE=/absolute/path/to/your/firebase-credentials.json
    ```
-   
-   You'll need:
-   - Your Firebase Realtime Database URL (format: `https://your-project.firebaseio.com`)
-   - Firebase service account credentials JSON file (downloadable from Firebase Console)
+
+   Notes:
+   - `FIREBASE_DB_BASE_URL` should be your Firebase Realtime Database URL (for example: `https://your-project.firebaseio.com`).
+   - `FIREBASE_CREDS_FILE` must be an absolute path to the downloaded Firebase service account JSON file on the Raspberry Pi.
 
 3. Set up Arduino connections:
    - Two Arduino boards with RFID readers will be detected during installation

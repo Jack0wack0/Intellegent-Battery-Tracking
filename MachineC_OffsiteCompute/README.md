@@ -46,11 +46,11 @@ pip install -r requirements.txt
 Create a `.env` file in this folder (or set environment variables system-wide) containing the following values:
 
 ```
-# GOOGLE_TOKEN_PATH=/creds/token.pickle
-# GOOGLE_CREDS_PATH=/creds/credentials.json
-# DRIVE_FOLDER_NAME="Folder name in google drive"
-# LOCAL_STORAGE_PATH=Backup location
-# TEST_DRIVE_FOLDER_ID=FOLDER_ID
+GOOGLE_TOKEN_PATH=/creds/token.pickle
+GOOGLE_CREDS_PATH=/creds/credentials.json
+DRIVE_FOLDER_NAME="Folder name in google drive"
+LOCAL_STORAGE_PATH=Backup location
+TEST_DRIVE_FOLDER_ID=FOLDER_ID
 ```
 
 Notes:

@@ -1,4 +1,4 @@
-# Intellegent-Battery-Timer — Arduino Code
+# Arduino Code
 
 This folder contains the Arduino sketches used on the two Arduino UNOs that monitor charging slots and drive an addressable LED strip.
 
@@ -39,7 +39,7 @@ Important implementation details
 - `RFID_ARDUINO_1.ino` contains a `delay(500)` after detecting a state change — this debounce/delay is required because the Pi reads the arduino output faster than the Pi can recieve the RFID ID; do not remove it.
 - `RFID_ARDUINO_2.ino` reports slots with `i + 6` so the second board occupies slots 6..11.
 
-Upload instructions
+# Upload instructions
 
 Arduino IDE
 1. Open the `.ino` file in the Arduino IDE.

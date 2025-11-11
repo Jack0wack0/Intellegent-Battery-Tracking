@@ -13,6 +13,9 @@ from logging.handlers import RotatingFileHandler
 import sys
 import re
 
+# Import WAL module for Firebase resilience
+from wal import LocalQueue
+
 # === CONFIGURATION ===
 load_dotenv()
 
@@ -118,6 +121,11 @@ firebase_admin.initialize_app(cred, {
 })
 
 ref = db.reference('/')
+
+# === WRITE-AHEAD LOGGING (WAL) ===
+# Initialize local queue for Firebase resilience
+firebase_queue = LocalQueue("firebase_queue.json", firebase_log)
+firebase_log.info("Write-Ahead Logging (WAL) initialized for Firebase resilience")
 
 # === STATE TRACKING ===
 slot_status = {}  # slot_id -> {"state": "PRESENT"/"REMOVED", "last_change": timestamp, "tag": optional tag}
@@ -249,12 +257,14 @@ def handle_serial(Serialport):
                 
                 # Try to match with pending RFID tag
                 matched_tag = None
+                matched_time = None
                 time.sleep(1) #wait for the keyboard input from the rfid reader to be processed, then match it with the slot.
                 
                 for tag, t_time in pending_tags:
                     match_log.debug(f"Comparing tag time {timestamp(t_time)} to slot time {timestamp(now)}")
                     if abs(now - t_time) <= MATCH_WINDOW_SECONDS:
-                        matched_tag = tag 
+                        matched_tag = tag
+                        matched_time = t_time
                         match_log.info(f"Tag Pulled: {matched_tag}")
                         break
                 if not matched_tag:
@@ -266,17 +276,17 @@ def handle_serial(Serialport):
                     
                     #if pending_tags changes between finding and removing it will raise value error.
                     try:
-                        pending_tags.remove((matched_tag, t_time))
+                        pending_tags.remove((matched_tag, matched_time))
                     except ValueError:
                         pass
                     
                     #Add the newly scanned battery/tag to the 'CurrentChargingList' to show as actively charging
                     #this could possibly be removed as i can just look at IsCharging: True. 
-                    ref.child('CurrentChargingList/' + matched_tag).update({
+                    firebase_queue.enqueue('CurrentChargingList/' + matched_tag, {
                         'ID': matched_tag,
                         'ChargingStartTime': timestamp(now), #Use this timestamp to later determine how long it's been charging for
-                    })
-                    firebase_log.debug("Added to CurrentChargingList")
+                    }, operation="update")
+                    firebase_log.debug("Added to CurrentChargingList (queued)")
                     #Pull all records of charging for this battery/tag
                     getCurrentChargingRecords = ref.child('BatteryList/' + matched_tag + '/ChargingRecords').get()
 
@@ -286,10 +296,10 @@ def handle_serial(Serialport):
                       firebase_log.info(f"First record for {matched_tag} created")
 
                     else: #Otherwise append a new record with the current start time and slot
-                      getCurrentChargingRecords.append({'StartTime': timestamp(now),'ChargingSlot': slot,'ID': len(getCurrentChargingRecords)})
+                      getCurrentChargingRecords.append({'StartTime': timestamp(now),'ChargingSlot': slot,'ID': len(getCurrentChargingRecords)}) # pyright: ignore[reportAttributeAccessIssue]
 
                     #Update the battery within firebase with the new charging data
-                    ref.child('BatteryList/' + matched_tag).update({
+                    firebase_queue.enqueue('BatteryList/' + matched_tag, {
                         'ID': matched_tag, #Battery Tag ID
                         'ChargingRecords': getCurrentChargingRecords, #Pass in new array with appended record
                         'IsCharging': True, #Set charging as true
@@ -297,7 +307,8 @@ def handle_serial(Serialport):
                         'ChargingStartTime': timestamp(now), #When was the most recent time it started charging - used to determine how long it's been charging for/Now time
                         'ChargingEndTime': None, #Remove the ChargingEndTime as it's currently charging
                         'LastChargingSlot': None, #Remove the LastChargingSlot as it's currently charging
-                    })
+                    }, operation="update")
+                    firebase_log.debug("BatteryList update queued")
                     
                     # Check if battery has a name in BatteryNames
                     name_ref = ref.child(f'BatteryNames/{matched_tag}')
@@ -305,11 +316,12 @@ def handle_serial(Serialport):
                     if not name_ref.get():
                         # Trigger the frontend to prompt naming
                         firebase_log.debug(f"No name found for {matched_tag}, prompting for name.")
-                        ref.child(f'NameRequests/{matched_tag}').set({
+                        firebase_queue.enqueue(f'NameRequests/{matched_tag}', {
                             'Slot': slot,
                             'Timestamp': timestamp(now),
                             'ID': matched_tag
-                        })
+                        }, operation="set")
+                        firebase_log.debug("Name request queued")
                     firebase_log.info(f"Name Exists for ID:{matched_tag}")
 
             elif state == "REMOVED":
@@ -317,8 +329,8 @@ def handle_serial(Serialport):
                     match_log.info(f"Tag {prev_tag} removed from slot {slot} at {timestamp(now)}")
                     slot_status[slot]["tag"] = None
                     # Remove the newly removed battery/tag from the 'CurrentChargingList' to show as no longer actively charging
-                    ref.child('CurrentChargingList/' + prev_tag).delete() #again this could be deleted.
-                    firebase_log.info("Removed from CurrentChargingList")
+                    firebase_queue.enqueue('CurrentChargingList/' + prev_tag, None, operation="delete")
+                    firebase_log.info("Removed from CurrentChargingList (queued)")
 
                     #Get the current (Now removed) charging slot for this battery/tag
                     chargingSlot = ref.child(f'BatteryList/{prev_tag}/ChargingSlot').get()
@@ -337,7 +349,11 @@ def handle_serial(Serialport):
                     firebase_log.debug(f"Duration for {prev_tag} was {duration}")
 
                     #Update the most recent record with the end time and duration, count-1 is used to get the most recent record since arrays are 0 indexed in Firebase
-                    ref.child(f'BatteryList/{prev_tag}/ChargingRecords/{count-1}').update({'EndTime': endTimeStamp, 'Duration': str(duration.total_seconds())[:-2]}) #Duration is saved in SECONDS with removing the default '.0' left with the total_seconds method I.E '30.0' seconds is saved as '30'
+                    firebase_queue.enqueue(f'BatteryList/{prev_tag}/ChargingRecords/{count-1}', {
+                        'EndTime': endTimeStamp, 
+                        'Duration': str(duration.total_seconds())[:-2]
+                    }, operation="update")
+                    firebase_log.debug(f"Charging record update queued for {prev_tag}")
 
                     #Remove the last record from the array to prevent it from being counted twice
                     #This last record is the one just updated, however is currently stored locally without duration/endtime
@@ -539,13 +555,13 @@ def pickNextSlot(slot_evaluations, min_time_setting):
     led_log.info(f"Next slot to pick: {pick_next_slot} (Tag: {tag})")
 
     try:
-        ref.child("BatteryNextUp").set({
+        firebase_queue.enqueue("BatteryNextUp", {
             "BatteryNext": tag,
             "Slot": pick_next_slot
-        })
-        led_log.info("Updated Firebase: BatteryNextUp")
+        }, operation="set")
+        led_log.info("Updated Firebase: BatteryNextUp (queued)")
     except Exception as e:
-        led_log.error(f"Failed to update BatteryNextUp: {e}")
+        led_log.error(f"Failed to queue BatteryNextUp: {e}")
 
     return pick_next_slot
 
@@ -566,13 +582,30 @@ def heartbeat_loop():
         }
 
         try:
-            ref.child("status").update(status_data)
-            firebase_log.info(f"Heartbeat update: {status_data}")
+            firebase_queue.enqueue("status", status_data, operation="update")
+            firebase_log.info(f"Heartbeat update queued: {status_data}")
         except Exception as e:
-            firebase_log.error(f"Failed to update Firebase status: {e}")
+            firebase_log.error(f"Failed to queue Firebase status: {e}")
 
         time.sleep(STATUS_INTERVAL)
 
+def wal_retry_loop():
+    """Background thread that periodically retries queued Firebase operations."""
+    RETRY_INTERVAL = 30.0  # seconds between retry attempts
+    firebase_log.info("WAL retry thread started (will retry queued operations every 30s)")
+    
+    while True:
+        try:
+            queue_size = firebase_queue.size()
+            if queue_size > 0:
+                firebase_log.info(f"[WAL] Attempting to process {queue_size} queued item(s)...")
+                processed = firebase_queue.process(ref, firebase_log)
+                if processed > 0:
+                    firebase_log.info(f"[WAL] Successfully processed {processed} queued item(s)")
+        except Exception as e:
+            firebase_log.error(f"[WAL] Error during retry loop: {e}")
+        
+        time.sleep(RETRY_INTERVAL)
 
 # === MAIN ===
 
@@ -583,6 +616,9 @@ if __name__ == "__main__":
     # Start the LED manager thread (reads DB and writes LED commands using the same COM_PORT1 serial object)
     threading.Thread(target=led_manager_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
+    
+    # Start the WAL retry thread to handle queued Firebase operations
+    threading.Thread(target=wal_retry_loop, daemon=True).start()
 
     listen_rfid()
 

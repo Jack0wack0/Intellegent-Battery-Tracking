@@ -125,7 +125,7 @@ ref = db.reference('/')
 # === WRITE-AHEAD LOGGING (WAL) ===
 # Initialize local queue for Firebase resilience
 firebase_queue = LocalQueue("firebase_queue.json", firebase_log)
-firebase_log.info("Write-Ahead Logging (WAL) initialized for Firebase resilience")
+firebase_log.info("Write-Ahead Logging initialized.")
 
 # === STATE TRACKING ===
 slot_status = {}  # slot_id -> {"state": "PRESENT"/"REMOVED", "last_change": timestamp, "tag": optional tag}

@@ -132,6 +132,9 @@ slot_status = {}  # slot_id -> {"state": "PRESENT"/"REMOVED", "last_change": tim
 pending_tags = []  # list of (tag_id, timestamp) tuples
 lock = threading.Lock()
 tag_buffer = ""
+# Startup blocking: if batteries are present when program starts, prevent tag matching
+startup_block = False
+startup_present_slots = set()
 
 # === SERIAL SHARED OBJECTS  ===
 # store opened serial.Serial objects here so the LED thread can reuse the same open port
@@ -194,6 +197,7 @@ def safe_write_serial(port, data):
 #literally just starts listening to the arduinos and when it detects a change start a match
 
 def handle_serial(Serialport):
+    global startup_block, startup_present_slots
     ser = None
     while True:    
         try:
@@ -255,40 +259,45 @@ def handle_serial(Serialport):
 
             if state == "PRESENT":
                 
-                # Try to match with pending RFID tag
-                matched_tag = None
-                matched_time = None
-                time.sleep(1) #wait for the keyboard input from the rfid reader to be processed, then match it with the slot.
-                
-                for tag, t_time in pending_tags:
-                    match_log.debug(f"Comparing tag time {timestamp(t_time)} to slot time {timestamp(now)}")
-                    if abs(now - t_time) <= MATCH_WINDOW_SECONDS:
-                        matched_tag = tag
-                        matched_time = t_time
-                        match_log.info(f"Tag Pulled: {matched_tag}")
-                        break
-                if not matched_tag:
-                    match_log.warning(f"No match found for slot {slot} at {timestamp(now)} — pending_tags: {pending_tags}")
+                # If startup detected present batteries, block matching until all removed
+                if startup_block:
+                    startup_present_slots.add(slot)
+                    firebase_log.warning(f"Startup: detected battery present in slot {slot}; blocking tag matching until cleared")
+                else:
+                    # Try to match with pending RFID tag
+                    matched_tag = None
+                    matched_time = None
+                    time.sleep(1) #wait for the keyboard input from the rfid reader to be processed, then match it with the slot.
+                    
+                    for tag, t_time in pending_tags:
+                        match_log.debug(f"Comparing tag time {timestamp(t_time)} to slot time {timestamp(now)}")
+                        if abs(now - t_time) <= MATCH_WINDOW_SECONDS:
+                            matched_tag = tag
+                            matched_time = t_time
+                            match_log.info(f"Tag Pulled: {matched_tag}")
+                            break
+                    if not matched_tag:
+                        match_log.warning(f"No match found for slot {slot} at {timestamp(now)} — pending_tags: {pending_tags}")
 
-                if matched_tag:
-                    match_log.info(f"Tag {matched_tag} matched to slot {slot} at {timestamp(now)}")
-                    slot_status[slot]["tag"] = matched_tag
-                    
-                    #if pending_tags changes between finding and removing it will raise value error.
-                    try:
-                        pending_tags.remove((matched_tag, matched_time))
-                    except ValueError:
-                        pass
-                    
-                    #Add the newly scanned battery/tag to the 'CurrentChargingList' to show as actively charging
-                    #this could possibly be removed as i can just look at IsCharging: True. 
-                    firebase_queue.enqueue('CurrentChargingList/' + matched_tag, {
-                        'ID': matched_tag,
-                        'ChargingStartTime': timestamp(now), #Use this timestamp to later determine how long it's been charging for
-                    }, operation="update")
-                    firebase_log.debug("Added to CurrentChargingList (queued)")
-                    #Pull all records of charging for this battery/tag
-                    getCurrentChargingRecords = ref.child('BatteryList/' + matched_tag + '/ChargingRecords').get()
+                    if matched_tag:
+                        match_log.info(f"Tag {matched_tag} matched to slot {slot} at {timestamp(now)}")
+                        slot_status[slot]["tag"] = matched_tag
+                        
+                        #if pending_tags changes between finding and removing it will raise value error.
+                        try:
+                            pending_tags.remove((matched_tag, matched_time))
+                        except ValueError:
+                            pass
+                        
+                        #Add the newly scanned battery/tag to the 'CurrentChargingList' to show as actively charging
+                        #this could possibly be removed as i can just look at IsCharging: True. 
+                        firebase_queue.enqueue('CurrentChargingList/' + matched_tag, {
+                            'ID': matched_tag,
+                            'ChargingStartTime': timestamp(now), #Use this timestamp to later determine how long it's been charging for
+                        }, operation="update")
+                        firebase_log.debug("Added to CurrentChargingList (queued)")
+                        #Pull all records of charging for this battery/tag
+                        getCurrentChargingRecords = ref.child('BatteryList/' + matched_tag + '/ChargingRecords').get()
 
                     if getCurrentChargingRecords is None: #Incase this is the first charge record for this battery/tag
                       getCurrentChargingRecords = [] #create an empty array for charging records
@@ -405,6 +414,20 @@ def handle_serial(Serialport):
                         'OverallChargeTime': overallDuration, #Overall lifetime charge time in seconds
                     })
 
+                    # If this slot was marked as present at startup, remove it from the startup_present_slots set
+                    if slot in startup_present_slots:
+                        try:
+                            startup_present_slots.discard(slot)
+                            firebase_log.info(f"Startup: slot {slot} cleared (was present at startup)")
+                            # If no more startup slots remain, clear the startup block and notify Firebase
+                            if not startup_present_slots:
+                                startup_block = False
+                                firebase_queue.enqueue("status/StartupError", False, operation="set")
+                                firebase_queue.enqueue("status/StartupErrorSlots", [], operation="set")
+                                firebase_log.info("Startup: all startup-present slots cleared; unblocking tag matching (queued)")
+                        except Exception as e:
+                            firebase_log.error(f"Error updating startup_present_slots on removal: {e}")
+
 #ALEX DO NOT USE .SET ANYMORE ONLY USE .UPDATE YOU PMO - Jackson 8/7/2025
 
 
@@ -457,8 +480,11 @@ def led_manager_loop():
         except Exception:
             min_time_setting = 0
 
+        # Snapshot shared runtime state once per loop for thread-safety
         with lock:
             local_slot_status = dict(slot_status)
+            local_startup_block = startup_block
+            local_startup_present = set(startup_present_slots)
 
         #Pull charging status directly from BatteryList
         batteries_ref = db.reference("BatteryList") 
@@ -497,18 +523,23 @@ def led_manager_loop():
 
         for slot in range(7):
             ev = slot_evaluations[slot]
-            if ev["state"] == "AVAILABLE":
-                mode, hue = "PULSE", HUE_ORANGE #slot is available
-            elif ev["state"] == "PRESENT":
-                if ev["elapsed"] and ev["elapsed"] >= min_time_setting:
-                    if slot == nextup:
-                        mode, hue = "DEEPPULSE", HUE_GREEN #pick this next
-                    else:
-                        mode, hue = "SOLID", HUE_BLUE #charged, but not the best available
-                else:
-                    mode, hue = "SOLID", HUE_RED #currently charging
+            # If we are in startup blocking mode and this slot was present at startup,
+            # make it flash red to indicate it must be cleared before matching.
+            if local_startup_block and slot in local_startup_present:
+                mode, hue = "DEEPPULSE", HUE_RED
             else:
-                mode, hue = "PULSE", HUE_ORANGE #i dont think this matters but it makes the code look cooler
+                if ev["state"] == "AVAILABLE":
+                    mode, hue = "PULSE", HUE_ORANGE #slot is available
+                elif ev["state"] == "PRESENT":
+                    if ev["elapsed"] and ev["elapsed"] >= min_time_setting:
+                        if slot == nextup:
+                            mode, hue = "DEEPPULSE", HUE_GREEN #pick this next
+                        else:
+                            mode, hue = "SOLID", HUE_BLUE #charged, but not the best available
+                    else:
+                        mode, hue = "SOLID", HUE_RED #currently charging
+                else:
+                    mode, hue = "PULSE", HUE_ORANGE #i dont think this matters but it makes the code look cooler
 
             pos = POSITIONS[slot] if slot < len(POSITIONS) else 0
             this_cmd = (mode, hue, pos)
@@ -610,16 +641,46 @@ def wal_retry_loop():
 # === MAIN ===
 
 if __name__ == "__main__":
+    # At startup, block matching until we scan for any present batteries reported by the hardware
+    startup_block = True
+    firebase_log.info("Startup: enabling startup_block to detect any present batteries before allowing matching")
+
+    # Start serial handler threads which will populate startup_present_slots if any PRESENCE messages arrive
     threading.Thread(target=handle_serial, args=(COM_PORT1,), daemon=True).start() #args is now the com port for each arduino, kept in hardwareIDS.json. This is so we can listen to both arduinos
     threading.Thread(target=handle_serial, args=(COM_PORT2,), daemon=True).start()
 
     # Start the LED manager thread (reads DB and writes LED commands using the same COM_PORT1 serial object)
     threading.Thread(target=led_manager_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
-    
     # Start the WAL retry thread to handle queued Firebase operations
     threading.Thread(target=wal_retry_loop, daemon=True).start()
 
+    # Give the serial handlers a short window to report current slot PRESENCE states
+    time.sleep(4)
+
+    # Snapshot startup_present_slots and enqueue a status if any slots are present
+    with lock:
+        startup_slots_snapshot = list(startup_present_slots)
+
+    if startup_slots_snapshot:
+        firebase_log.warning(f"Startup detected batteries present in slots: {startup_slots_snapshot}. Matching will be blocked until cleared.")
+        try:
+            firebase_queue.enqueue("status/StartupError", True, operation="set")
+            firebase_queue.enqueue("status/StartupErrorSlots", startup_slots_snapshot, operation="set")
+            firebase_log.info("Startup: enqueued StartupError status and slots (queued)")
+        except Exception as e:
+            firebase_log.error(f"Failed to enqueue startup status: {e}")
+    else:
+        # No present batteries detected at startup; clear the startup block and notify Firebase
+        startup_block = False
+        try:
+            firebase_queue.enqueue("status/StartupError", False, operation="set")
+            firebase_queue.enqueue("status/StartupErrorSlots", [], operation="set")
+            firebase_log.info("Startup: no batteries present; StartupError cleared (queued)")
+        except Exception as e:
+            firebase_log.error(f"Failed to enqueue startup clear status: {e}")
+
+    # Now start the RFID listener in the main thread (blocks here)
     listen_rfid()
 
     # Keep alive

@@ -136,6 +136,12 @@ tag_buffer = ""
 startup_block = False
 startup_present_slots = set()
 
+# === TAG BUFFERING (FLICKERING DETECTION) ===
+# Track recent removals to detect and recover from flickering
+# Format: (slot, tag) -> removal_timestamp
+recent_removals = {}  # {(slot, tag): removal_time}
+REMOVAL_GRACE_PERIOD = 3.0  # seconds; if tag returns within this window, resume charging
+
 # === SERIAL SHARED OBJECTS  ===
 # store opened serial.Serial objects here so the LED thread can reuse the same open port
 serial_ports = {}            # port_str -> serial.Serial object
@@ -264,24 +270,73 @@ def handle_serial(Serialport):
                     startup_present_slots.add(slot)
                     firebase_log.warning(f"Startup: detected battery present in slot {slot}; blocking tag matching until cleared")
                 else:
-                    # Try to match with pending RFID tag
-                    matched_tag = None
-                    matched_time = None
-                    time.sleep(1) #wait for the keyboard input from the rfid reader to be processed, then match it with the slot.
+                    # Clean up stale entries from recent_removals that have exceeded the grace period
+                    stale_keys = [(s, t) for (s, t), rt in recent_removals.items() if (now - rt) > REMOVAL_GRACE_PERIOD]
+                    for key in stale_keys:
+                        del recent_removals[key]
                     
-                    for tag, t_time in pending_tags:
-                        match_log.debug(f"Comparing tag time {timestamp(t_time)} to slot time {timestamp(now)}")
-                        if abs(now - t_time) <= MATCH_WINDOW_SECONDS:
-                            matched_tag = tag
-                            matched_time = t_time
-                            match_log.info(f"Tag Pulled: {matched_tag}")
-                            break
-                    if not matched_tag:
-                        match_log.warning(f"No match found for slot {slot} at {timestamp(now)} — pending_tags: {pending_tags}")
-
-                    if matched_tag:
-                        match_log.info(f"Tag {matched_tag} matched to slot {slot} at {timestamp(now)}")
+                    # Check if this is a flickering resume (same tag returned within grace period)
+                    flickering_resume = False
+                    resumed_tag = None
+                    for (recent_slot, recent_tag), removal_time in list(recent_removals.items()):
+                        if recent_slot == slot and (now - removal_time) <= REMOVAL_GRACE_PERIOD:
+                            # Check if we have a pending match for the same tag, or if RFID matched this tag
+                            # For now, we'll only resume if it's the exact same tag (detected via RFID or default)
+                            # Actually, we need to peek at pending RFID to see if same tag is being matched
+                            for pending_tag, t_time in pending_tags:
+                                if pending_tag == recent_tag and abs(now - t_time) <= MATCH_WINDOW_SECONDS:
+                                    flickering_resume = True
+                                    resumed_tag = recent_tag
+                                    match_log.info(f"Flickering resume: tag {resumed_tag} re-detected in slot {slot} within grace period ({now - removal_time:.2f}s)")
+                                    # Remove from recent_removals since we're resuming
+                                    del recent_removals[(recent_slot, recent_tag)]
+                                    # Remove from pending_tags
+                                    try:
+                                        pending_tags.remove((pending_tag, t_time))
+                                    except ValueError:
+                                        pass
+                                    break
+                            if flickering_resume:
+                                break
+                    
+                    if flickering_resume and resumed_tag:
+                        # Resume the previous charging session
+                        matched_tag = resumed_tag
+                        match_log.info(f"Tag {matched_tag} resumed charging in slot {slot}")
                         slot_status[slot]["tag"] = matched_tag
+                        # Re-add to CurrentChargingList and update BatteryList (resume operation)
+                        firebase_queue.enqueue('CurrentChargingList/' + matched_tag, {
+                            'ID': matched_tag,
+                            'ChargingStartTime': timestamp(now),
+                        }, operation="update")
+                        firebase_log.debug(f"Resumed charging for {matched_tag} (queued)")
+                        # Update BatteryList to mark as actively charging again
+                        firebase_queue.enqueue('BatteryList/' + matched_tag, {
+                            'ID': matched_tag,
+                            'IsCharging': True,
+                            'ChargingSlot': slot,
+                            'ChargingEndTime': None,
+                        }, operation="update")
+                        firebase_log.debug(f"BatteryList resumed for {matched_tag} (queued)")
+                    else:
+                        # Normal matching: Try to match with pending RFID tag
+                        matched_tag = None
+                        matched_time = None
+                        time.sleep(1) #wait for the keyboard input from the rfid reader to be processed, then match it with the slot.
+                        
+                        for tag, t_time in pending_tags:
+                            match_log.debug(f"Comparing tag time {timestamp(t_time)} to slot time {timestamp(now)}")
+                            if abs(now - t_time) <= MATCH_WINDOW_SECONDS:
+                                matched_tag = tag
+                                matched_time = t_time
+                                match_log.info(f"Tag Pulled: {matched_tag}")
+                                break
+                        if not matched_tag:
+                            match_log.warning(f"No match found for slot {slot} at {timestamp(now)} — pending_tags: {pending_tags}")
+
+                        if matched_tag:
+                            match_log.info(f"Tag {matched_tag} matched to slot {slot} at {timestamp(now)}")
+                            slot_status[slot]["tag"] = matched_tag
                         
                         #if pending_tags changes between finding and removing it will raise value error.
                         try:
@@ -337,7 +392,34 @@ def handle_serial(Serialport):
                 if prev_tag:
                     match_log.info(f"Tag {prev_tag} removed from slot {slot} at {timestamp(now)}")
                     slot_status[slot]["tag"] = None
-                    # Remove the newly removed battery/tag from the 'CurrentChargingList' to show as no longer actively charging
+                    
+                    # Track this removal for flickering detection (grace period buffer)
+                    recent_removals[(slot, prev_tag)] = now
+                    match_log.debug(f"Tracked removal: slot {slot}, tag {prev_tag} at {timestamp(now)} (grace period: {REMOVAL_GRACE_PERIOD}s)")
+                    
+                    # Schedule a background task to finalize the removal after grace period
+                    def finalize_removal_after_grace_period(slot_num, tag_id, removal_t):
+                        time.sleep(REMOVAL_GRACE_PERIOD)
+                        with lock:
+                            # Check if this removal is still in recent_removals (i.e., not resumed)
+                            if (slot_num, tag_id) not in recent_removals:
+                                # Tag was resumed, skip finalization
+                                match_log.debug(f"Skipping finalization for slot {slot_num}, tag {tag_id} (was resumed)")
+                                return
+                            # Remove from tracking
+                            del recent_removals[(slot_num, tag_id)]
+                        
+                        # Finalize the charging session (write to Firebase, calculate duration, etc.)
+                        firebase_log.info(f"Finalizing removal for {tag_id} from slot {slot_num} after grace period")
+                        try:
+                            finalize_charging_removal(tag_id, slot_num, removal_t)
+                        except Exception as e:
+                            firebase_log.error(f"Error finalizing removal for {tag_id}: {e}")
+                    
+                    threading.Thread(target=finalize_removal_after_grace_period, args=(slot, prev_tag, now), daemon=True).start()
+                    firebase_log.debug(f"Scheduled finalization thread for tag {prev_tag} after grace period")
+                    
+                    # Immediately remove from CurrentChargingList (visual feedback)
                     firebase_queue.enqueue('CurrentChargingList/' + prev_tag, None, operation="delete")
                     firebase_log.info("Removed from CurrentChargingList (queued)")
 
@@ -430,6 +512,83 @@ def handle_serial(Serialport):
 
 #ALEX DO NOT USE .SET ANYMORE ONLY USE .UPDATE YOU PMO - Jackson 8/7/2025
 
+# === HELPER FUNCTION: Finalize Charging Removal ===
+def finalize_charging_removal(tag_id, slot_num, removal_timestamp):
+    """Finalize a charging session removal after grace period. Called from background thread."""
+    now = removal_timestamp
+    
+    #Get the current (Now removed) charging slot for this battery/tag
+    chargingSlot = ref.child(f'BatteryList/{tag_id}/ChargingSlot').get()
+
+    #Pull all records of charging for this battery/tag
+    getCurrentChargingRecords = ref.child('BatteryList/' + tag_id + '/ChargingRecords').get()
+
+    #Count the number of existing records to determine the ID of the most recent record
+    count = len(getCurrentChargingRecords) if getCurrentChargingRecords else 0 #Set to 0 if this is the first record for firebase 'array'
+    startTime = ref.child(f'BatteryList/{tag_id}/ChargingRecords/{count-1}/StartTime').get() #Pull the start time of the most recent record to determine duration
+    endTime = timestamp(now) #Set the end time as now since it's just been removed
+    endTimeStamp = timestamp(now) #Set the end time as now since it's just been removed
+    endTime = datetime.strptime(endTime, "%Y-%m-%d %H:%M:%S") #Convert to datetime object
+    startTime = datetime.strptime(startTime, "%Y-%m-%d %H:%M:%S") #Convert to datetime object
+    duration = endTime - startTime #Determine the duration between start and end time 
+    firebase_log.debug(f"Duration for {tag_id} was {duration}")
+
+    #Update the most recent record with the end time and duration, count-1 is used to get the most recent record since arrays are 0 indexed in Firebase
+    firebase_queue.enqueue(f'BatteryList/{tag_id}/ChargingRecords/{count-1}', {
+        'EndTime': endTimeStamp, 
+        'Duration': str(duration.total_seconds())[:-2]
+    }, operation="update")
+    firebase_log.debug(f"Charging record update queued for {tag_id}")
+
+    #Remove the last record from the array to prevent it from being counted twice
+    #This last record is the one just updated, however is currently stored locally without duration/endtime
+    #Basically, remove the incomplete record from the local copy of the records array to then later add the completed record locally
+    del getCurrentChargingRecords[-1]
+
+    #Due to not waiting on confirmation from firebase that the above update has been made, manually append the end time and duration to the local copy of the records array
+    getCurrentChargingRecords.append({'StartTime': startTime,'EndTime': endTime,'Duration': str(duration.total_seconds())[:-2]})
+    firebase_log.info(f"Updated record for {tag_id} with end time and duration")
+
+    #Calculate the overall charge time and average charge time
+    #Note, everything is in SECONDS
+    overallDuration = 0
+    avgDuration = 0
+    totalCycles = 0 #Get the total number of cycles for this battery/tag
+    minTimeSetting = ref.child(f'Settings/minTime').get() #Get the minimum time settings for the battery.
+    firebase_log.debug(f"Pulled Minimum Time Setting {minTimeSetting} seconds")
+    for record in getCurrentChargingRecords: #Loop through all records for this battery/tag
+        
+        if float(record['Duration']) >= int(minTimeSetting): #Only count records that are above the minimum time setting
+            totalCycles += 1 #Increment the total cycles for this battery/tag
+            overallDuration += int(record.get('Duration')) #Overall charge time is the sum of all durations in the records array
+
+    if totalCycles > 0:    
+      avgDuration = overallDuration/totalCycles   #Average charge time is the overall charge time divided by the number of cycles
+      avgDuration = "{:.0f}".format(avgDuration) #Format to remove decimal places, this also rounds DOWN by removing the decimal places
+
+    if int(str(duration.total_seconds())[:-2]) < int(minTimeSetting):
+        ref.child('BatteryList/' + tag_id).update({
+        'ID': tag_id,
+        'IsCharging': False, #Set charging as false
+        'ChargingSlot': None, #Remove the ChargingSlot as it's no longer charging
+        'LastChargingSlot': chargingSlot, #Set the last charging slot to the current slot it was charging in
+        'TotalCycles' : totalCycles, #Total number of charge cycles for this battery/tag
+        'AverageChargeTime': avgDuration, #Average charge time in seconds
+        'OverallChargeTime': overallDuration, #Overall lifetime charge time in seconds
+    })
+    else:
+        ref.child('BatteryList/' + tag_id).update({
+        'ID': tag_id,
+        'IsCharging': False, #Set charging as false
+        'ChargingSlot': None, #Remove the ChargingSlot as it's no longer charging
+        'LastChargingSlot': chargingSlot, #Set the last charging slot to the current slot it was charging in
+        'ChargingEndTime': timestamp(now), #When was the most recent time it was on a charger
+        'ChargingStartTime': None, #Remove the ChargingStartTime as it's no longer charging
+        'LastOverallChargeTime': str(duration.total_seconds())[:-2], #Set the last overall charge time to the duration of the most recent charge 
+        'TotalCycles' : totalCycles, #Total number of charge cycles for this battery/tag
+        'AverageChargeTime': avgDuration, #Average charge time in seconds
+        'OverallChargeTime': overallDuration, #Overall lifetime charge time in seconds
+    })
 
 # === RFID LISTENER THREAD ===
 # essentially all this does is look for a 10 digit string of numbers coming in from the keyboard. if it detects it, add it to pending_tags.

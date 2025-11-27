@@ -1,3 +1,4 @@
+#imports
 from datetime import datetime
 import serial
 import threading
@@ -12,12 +13,10 @@ import logging
 from logging.handlers import RotatingFileHandler
 import sys
 import re
-
-# Import WAL module for Firebase resilience
-from wal import LocalQueue
+from wal import LocalQueue #LOCAL FILE
 
 # === CONFIGURATION ===
-load_dotenv()
+load_dotenv() #load up creds
 
 # === LOGGING CONFIGURATION ===
 root_logger = logging.getLogger()
@@ -92,14 +91,16 @@ general_log.info("Logging initialized. Program has just been started. ==========
 general_log.info("===============================================================================================")
 
 # open the json and load the serial port IDS of the arduinos. change hardwareIDS.json to change your hardware ids of your arduinos.
-with open("hardwareIDS.json") as hardwareID:
+with open("hardwareIDS.json") as hardwareID: 
     RemoteID = json.load(hardwareID)
+
+#in theory the install script manages all this file creation automatically. The only file that needs to be moved is the actual firebase.json. 
 
 COM_PORT1 = RemoteID["COM_PORT1"] #init com ports
 COM_PORT2 = RemoteID["COM_PORT2"] 
-BAUD_RATE = 9600
+BAUD_RATE = 9600 #dont change this
 MATCH_WINDOW_SECONDS = 3.0 #change to adjust the window for matching slots and RFID ID numbers.
-FIREBASE_DB_BASE_URL = getenv('FIREBASE_DB_BASE_URL')
+FIREBASE_DB_BASE_URL = getenv('FIREBASE_DB_BASE_URL') #pull creds via env
 FIREBASE_CREDS_FILE = getenv('FIREBASE_CREDS_FILE')
 
 general_log.info(f"Loaded hardware IDs: {RemoteID}")
@@ -503,12 +504,12 @@ def handle_serial(Serialport):
                             firebase_log.info(f"Startup: slot {slot} cleared (was present at startup)")
                             # If no more startup slots remain, clear the startup block and notify Firebase
                             if not startup_present_slots:
-                                startup_block = False
+                                startup_block = False #set false for main
                                 firebase_queue.enqueue("status/StartupError", False, operation="set")
                                 firebase_queue.enqueue("status/StartupErrorSlots", [], operation="set")
                                 firebase_log.info("Startup: all startup-present slots cleared; unblocking tag matching (queued)")
                         except Exception as e:
-                            firebase_log.error(f"Error updating startup_present_slots on removal: {e}")
+                            firebase_log.error(f"Error updating startup_present_slots on removal: {e}") #should hopefully never happen
 
 #ALEX DO NOT USE .SET ANYMORE ONLY USE .UPDATE YOU PMO - Jackson 8/7/2025
 
@@ -602,7 +603,7 @@ def listen_rfid():
             now = time.time()
             with lock:
                 pending_tags.append((tag_id, now)) #timestamp the tag scan and send it off to be matched with a slot <3
-                rfid_log.info(f"Tag Read: {tag_id} at {timestamp(now)}")
+                rfid_log.info(f"Tag Read: {tag_id} at {timestamp(now)}") #stamp it
         else:
             rfid_log.warning(f"Ignored invalid input: {tag_buffer}") #log it
             tag_buffer = "" #clear the buffer
@@ -617,7 +618,7 @@ def led_manager_loop():
         with serial_ports_lock:
             ser = serial_ports.get(COM_PORT1) #we have to share the com port so we are just waiting for the parent function (handle_serial) to open the serial interface
         if ser:
-            break
+            break #get out when its detected
         led_log.debug("Waiting for COM_PORT1 to be opened by handle_serial...")
         time.sleep(0.5) #dont spam
 
@@ -801,17 +802,18 @@ def wal_retry_loop():
 
 if __name__ == "__main__":
     # At startup, block matching until we scan for any present batteries reported by the hardware
-    startup_block = True
+    startup_block = True #block statuses until this has been flagged as false. Only needs to happen on startup, otherwise the pi can track everything super well. 
+    # startup block prevents missed charging events by forcing the user to remove all batteries on the charger and replacing them. 
+    # we cannot force the readers to re-output their IDS. it only happens on first presence. This is why this is needed. If it didnt exist, then batteries that
+    # are already on the charger will not exist in db, because the readers will scan before we can log it and post to db.
     firebase_log.info("Startup: enabling startup_block to detect any present batteries before allowing matching")
+    firebase_log.info(f"startup block is set to: {startup_block}") #log the present status
 
-    # Start serial handler threads which will populate startup_present_slots if any PRESENCE messages arrive
+    # create all our threads. This is called threadlocking and is good for this program. google it idk how it works.
     threading.Thread(target=handle_serial, args=(COM_PORT1,), daemon=True).start() #args is now the com port for each arduino, kept in hardwareIDS.json. This is so we can listen to both arduinos
     threading.Thread(target=handle_serial, args=(COM_PORT2,), daemon=True).start()
-
-    # Start the LED manager thread (reads DB and writes LED commands using the same COM_PORT1 serial object)
     threading.Thread(target=led_manager_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
-    # Start the WAL retry thread to handle queued Firebase operations
     threading.Thread(target=wal_retry_loop, daemon=True).start()
 
     # Give the serial handlers a short window to report current slot PRESENCE states

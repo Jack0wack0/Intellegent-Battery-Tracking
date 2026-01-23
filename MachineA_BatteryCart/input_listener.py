@@ -226,8 +226,12 @@ def handle_serial(Serialport):
         try:
             raw_line = ser.readline().decode("utf-8").strip()
             serial_log.info(f"RAW LINE: '{raw_line}' from {Serialport}")
-        except Exception:
+        except UnicodeDecodeError as e:
+            serial_log.warning(f"Unicode decode error on {Serialport}: {e}")
             continue
+        except Exception as e:
+            serial_log.critical(f"Serial read error on {Serialport}: {e}. Attempting to reconnect...")
+            break  # Break inner loop to trigger reconnection
         
         # --- ACK Handling ---
         if raw_line == "ACK" or raw_line == "OK":
@@ -628,108 +632,110 @@ def led_manager_loop():
         return ack_received.wait(timeout=timeout)
 
     while True:
-        loop_start = time.time()
-
-        if (time.time() - last_heartbeat) >= HEARTBEAT_INTERVAL:
-            safe_write_serial(COM_PORT1, "PING\n")
-            last_heartbeat = time.time()
-            led_log.debug("PING sent") 
-
         try:
-            min_time_setting = int(ref.child('Settings/minTime').get() or 0) #pull min time setting for rendering the LEDS
-        except Exception:
-            min_time_setting = 0
+            loop_start = time.time()
 
-        # Snapshot shared runtime state once per loop for thread-safety
-        with lock:
-            local_slot_status = dict(slot_status)
-            local_startup_block = startup_block
-            local_startup_present = set(startup_present_slots)
+            if (time.time() - last_heartbeat) >= HEARTBEAT_INTERVAL:
+                safe_write_serial(COM_PORT1, "PING\n")
+                last_heartbeat = time.time()
+                led_log.debug("PING sent") 
 
-        #Pull charging status directly from BatteryList
-        batteries_ref = db.reference("BatteryList") 
-        batteries = batteries_ref.get() or {} 
+            try:
+                min_time_setting = int(ref.child('Settings/minTime').get() or 0) #pull min time setting for rendering the LEDS
+            except Exception:
+                min_time_setting = 0
 
-        # Build mapping of slot -> (tag, battery_data)
-        slot_to_battery = {}
-        for tag, data in batteries.items():
-            if not isinstance(data, dict): 
-                continue
-            if data.get("IsCharging") and data.get("ChargingSlot") is not None: #if its currently charging
-                slot_to_battery[data["ChargingSlot"]] = (tag, data)
-                led_log.info(f"Battery {tag} in slot {data['ChargingSlot']} is charging")
+            # Snapshot shared runtime state once per loop for thread-safety
+            with lock:
+                local_slot_status = dict(slot_status)
+                local_startup_block = startup_block
+                local_startup_present = set(startup_present_slots)
 
-        # Iterate through all slots
-        slot_evaluations = {}
-        for slot in range(7):
-            entry = {"state": "AVAILABLE", "tag": None, "elapsed": None}
-            if slot in slot_to_battery:
-                tag, bdata = slot_to_battery[slot]
-                entry["state"] = "PRESENT"
-                entry["tag"] = tag
-                cst = bdata.get("ChargingStartTime")
-                epoch = parse_timestamp_to_epoch(cst) if cst else None
-                if epoch:
-                    entry["elapsed"] = time.time() - epoch
-            slot_evaluations[slot] = entry
+            #Pull charging status directly from BatteryList
+            batteries_ref = db.reference("BatteryList") 
+            batteries = batteries_ref.get() or {} 
 
-        
-        pickNextSlot(slot_evaluations, min_time_setting)
-        nextup = pickNextSlot(slot_evaluations, min_time_setting)
-        led_log.info(f"Next slot to pick: {nextup}")
+            # Build mapping of slot -> (tag, battery_data)
+            slot_to_battery = {}
+            for tag, data in batteries.items():
+                if not isinstance(data, dict): 
+                    continue
+                if data.get("IsCharging") and data.get("ChargingSlot") is not None: #if its currently charging
+                    slot_to_battery[data["ChargingSlot"]] = (tag, data)
+                    led_log.info(f"Battery {tag} in slot {data['ChargingSlot']} is charging")
 
-        
-        
+            # Iterate through all slots
+            slot_evaluations = {}
+            for slot in range(7):
+                entry = {"state": "AVAILABLE", "tag": None, "elapsed": None}
+                if slot in slot_to_battery:
+                    tag, bdata = slot_to_battery[slot]
+                    entry["state"] = "PRESENT"
+                    entry["tag"] = tag
+                    cst = bdata.get("ChargingStartTime")
+                    epoch = parse_timestamp_to_epoch(cst) if cst else None
+                    if epoch:
+                        entry["elapsed"] = time.time() - epoch
+                slot_evaluations[slot] = entry
 
-        for slot in range(7):
-            ev = slot_evaluations[slot]
-            # If we are in startup blocking mode and this slot was present at startup,
-            # make it flash red to indicate it must be cleared before matching.
-            if local_startup_block and slot in local_startup_present:
-                mode, hue = "DEEPPULSE", HUE_RED
-            else:
-                if ev["state"] == "AVAILABLE":
-                    mode, hue = "PULSE", HUE_ORANGE #slot is available
-                elif ev["state"] == "PRESENT":
-                    if ev["elapsed"] and ev["elapsed"] >= min_time_setting:
-                        if slot == nextup:
-                            mode, hue = "DEEPPULSE", HUE_GREEN #pick this next
-                        else:
-                            mode, hue = "SOLID", HUE_BLUE #charged, but not the best available
-                    else:
-                        mode, hue = "SOLID", HUE_RED #currently charging
+            pickNextSlot(slot_evaluations, min_time_setting)
+            nextup = pickNextSlot(slot_evaluations, min_time_setting)
+            led_log.info(f"Next slot to pick: {nextup}")
+
+            for slot in range(7):
+                ev = slot_evaluations[slot]
+                # If we are in startup blocking mode and this slot was present at startup,
+                # make it flash red to indicate it must be cleared before matching.
+                if local_startup_block and slot in local_startup_present:
+                    mode, hue = "DEEPPULSE", HUE_RED
                 else:
-                    mode, hue = "PULSE", HUE_ORANGE #i dont think this matters but it makes the code look cooler
-
-            pos = POSITIONS[slot] if slot < len(POSITIONS) else 0
-            this_cmd = (mode, hue, pos)
-            last = last_sent_command.get(slot)
-
-            if this_cmd != last: #just make sure we are not repeating commands
-                cmd_str = f"SEG {slot} POS {pos} COLOR {hue} MODE {mode}\n" #sets the command format
-                retries = 0
-                while retries < MAX_RETRIES: #retry logic
-                    if safe_write_serial(COM_PORT1, cmd_str):
-                        led_log.info(f"Sent: {cmd_str.strip()} (attempt {retries+1})")
-                        if wait_for_ack():
-                            last_sent_command[slot] = this_cmd
-                            break
+                    if ev["state"] == "AVAILABLE":
+                        mode, hue = "PULSE", HUE_ORANGE #slot is available
+                    elif ev["state"] == "PRESENT":
+                        if ev["elapsed"] and ev["elapsed"] >= min_time_setting:
+                            if slot == nextup:
+                                mode, hue = "DEEPPULSE", HUE_GREEN #pick this next
+                            else:
+                                mode, hue = "SOLID", HUE_BLUE #charged, but not the best available
                         else:
-                            retries += 1
-                            led_log.warning(f"No ACK received for slot {slot}, retrying ({retries}/{MAX_RETRIES})...")
-                            time.sleep(0.2)
+                            mode, hue = "SOLID", HUE_RED #currently charging
                     else:
-                        led_log.error(f"Failed to send command for slot {slot}")
-                        break
-                if retries >= MAX_RETRIES:
-                    led_log.critical(f"Failed to confirm slot {slot} command after {MAX_RETRIES} attempts. Critical error, LEDs may be out of sync.")
-                    led_log.warning("LEDS OUT OF SYNC")
+                        mode, hue = "PULSE", HUE_ORANGE #i dont think this matters but it makes the code look cooler
 
-            time.sleep(0.1)
+                pos = POSITIONS[slot] if slot < len(POSITIONS) else 0
+                this_cmd = (mode, hue, pos)
+                last = last_sent_command.get(slot)
 
-        elapsed = time.time() - loop_start
-        sleep_time = max(0, POLL_INTERVAL - elapsed)
-        time.sleep(sleep_time)
+                if this_cmd != last: #just make sure we are not repeating commands
+                    cmd_str = f"SEG {slot} POS {pos} COLOR {hue} MODE {mode}\n" #sets the command format
+                    retries = 0
+                    while retries < MAX_RETRIES: #retry logic
+                        if safe_write_serial(COM_PORT1, cmd_str):
+                            led_log.info(f"Sent: {cmd_str.strip()} (attempt {retries+1})")
+                            if wait_for_ack():
+                                last_sent_command[slot] = this_cmd
+                                break
+                            else:
+                                retries += 1
+                                led_log.warning(f"No ACK received for slot {slot}, retrying ({retries}/{MAX_RETRIES})...")
+                                time.sleep(0.2)
+                        else:
+                            led_log.error(f"Failed to send command for slot {slot}")
+                            break
+                    if retries >= MAX_RETRIES:
+                        led_log.critical(f"Failed to confirm slot {slot} command after {MAX_RETRIES} attempts. Critical error, LEDs may be out of sync.")
+                        led_log.warning("LEDS OUT OF SYNC")
+
+                time.sleep(0.1)
+
+            elapsed = time.time() - loop_start
+            sleep_time = max(0, POLL_INTERVAL - elapsed)
+            time.sleep(sleep_time)
+        except Exception as e:
+            led_log.critical(f"LED manager crashed: {e}")
+            import traceback
+            led_log.critical(traceback.format_exc())
+            time.sleep(5)  # Wait before retrying to avoid spam
 
 def pickNextSlot(slot_evaluations, min_time_setting):
     fully_charged = [

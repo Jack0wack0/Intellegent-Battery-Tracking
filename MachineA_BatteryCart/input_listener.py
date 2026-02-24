@@ -114,14 +114,14 @@ if not FIREBASE_DB_BASE_URL or not FIREBASE_CREDS_FILE:
     sys.exit(1)
 
 
-# Initialize the app with a service account, granting admin privileges
+# Initialize the app with a service account
 cred = credentials.Certificate(FIREBASE_CREDS_FILE)
 firebase_log.info("Creds loaded")
 firebase_admin.initialize_app(cred, {
     'databaseURL': FIREBASE_DB_BASE_URL
 })
 
-ref = db.reference('/')
+ref = db.reference('/') #reference the root of the database
 
 # === WRITE-AHEAD LOGGING (WAL) ===
 # Initialize local queue for Firebase resilience

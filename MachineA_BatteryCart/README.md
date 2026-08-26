@@ -103,6 +103,10 @@ Once installed and running, the system will:
 - Firebase connection: Verify credentials in `.env` file
 - LED sync issues: Check Arduino connections and restart service
 
+## Website health reporting
+
+The Pi heartbeat publishes `status/COM_PORT1`, `status/COM_PORT2`, `status/CPU_Temp`, and `status/LastUpdated` every 10 seconds. The website treats the Pi and Arduino connections as offline when the heartbeat is older than 30 seconds. Serial read failures, repeated LED command failures, LED manager crashes, and heartbeat write failures are queued under `status/CriticalErrors/<timestamp>` for the admin console.
+
 ## Support
 
 For issues and support, please create an issue in the repository or contact me.

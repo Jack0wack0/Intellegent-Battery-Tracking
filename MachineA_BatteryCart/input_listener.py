@@ -15,6 +15,7 @@ import sys
 import re
 from wal import LocalQueue #LOCAL FILE
 
+
 # === CONFIGURATION ===
 load_dotenv() #load up creds
 
@@ -128,6 +129,23 @@ ref = db.reference('/') #reference the root of the database
 firebase_queue = LocalQueue("firebase_queue.json", firebase_log)
 firebase_log.info("Write-Ahead Logging initialized.")
 
+def report_critical_error(source, message, details=None):
+    """Publish a compact critical event for the web admin console."""
+    try:
+        error_id = str(int(time.time() * 1000))
+        event = {
+            "source": source,
+            "message": str(message),
+            "timestamp": timestamp(),
+            "severity": "critical",
+            "acknowledged": False,
+        }
+        if details:
+            event["details"] = str(details)
+        firebase_queue.enqueue(f"status/CriticalErrors/{error_id}", event, operation="update")
+    except Exception as report_error:
+        firebase_log.error(f"Failed to report critical error: {report_error}")
+
 # === STATE TRACKING ===
 slot_status = {}  # slot_id -> {"state": "PRESENT"/"REMOVED", "last_change": timestamp, "tag": optional tag}
 pending_tags = []  # list of (tag_id, timestamp) tuples
@@ -231,6 +249,7 @@ def handle_serial(Serialport):
             continue
         except Exception as e:
             serial_log.critical(f"Serial read error on {Serialport}: {e}. Attempting to reconnect...")
+            report_critical_error("serial", f"Serial read failed on {Serialport}", e)
             break  # Break inner loop to trigger reconnection
         
         # --- ACK Handling ---
@@ -342,6 +361,9 @@ def handle_serial(Serialport):
                         if matched_tag:
                             match_log.info(f"Tag {matched_tag} matched to slot {slot} at {timestamp(now)}")
                             slot_status[slot]["tag"] = matched_tag
+                        else:
+                            match_log.warning(f"Ignoring slot {slot} PRESENT event without a matching RFID tag")
+                            continue
                         
                         #if pending_tags changes between finding and removing it will raise value error.
                         try:
@@ -394,6 +416,13 @@ def handle_serial(Serialport):
                     firebase_log.info(f"Name Exists for ID:{matched_tag}")
 
             elif state == "REMOVED":
+                if not prev_tag and slot in startup_present_slots:
+                    startup_present_slots.discard(slot)
+                    firebase_log.info(f"Startup: untagged slot {slot} cleared")
+                    if not startup_present_slots:
+                        startup_block = False
+                        firebase_queue.enqueue("status/StartupError", False, operation="set")
+                        firebase_queue.enqueue("status/StartupErrorSlots", [], operation="set")
                 if prev_tag:
                     match_log.info(f"Tag {prev_tag} removed from slot {slot} at {timestamp(now)}")
                     slot_status[slot]["tag"] = None
@@ -724,6 +753,7 @@ def led_manager_loop():
                             break
                     if retries >= MAX_RETRIES:
                         led_log.critical(f"Failed to confirm slot {slot} command after {MAX_RETRIES} attempts. Critical error, LEDs may be out of sync.")
+                        report_critical_error("led", f"LED command failed for slot {slot}", f"Command: {cmd_str.strip()}")
                         led_log.warning("LEDS OUT OF SYNC")
 
                 time.sleep(0.1)
@@ -735,6 +765,7 @@ def led_manager_loop():
             led_log.critical(f"LED manager crashed: {e}")
             import traceback
             led_log.critical(traceback.format_exc())
+            report_critical_error("led", "LED manager crashed", e)
             time.sleep(5)  # Wait before retrying to avoid spam
 
 def pickNextSlot(slot_evaluations, min_time_setting):
@@ -771,10 +802,16 @@ def heartbeat_loop():
         with serial_ports_lock:
             ports_snapshot = dict(serial_ports)
 
+        try:
+            cpu_temp = round(float(open("/sys/class/thermal/thermal_zone0/temp").read()) / 1000, 1)
+        except Exception as e:
+            cpu_temp = None
+            report_critical_error("pi", "CPU temperature sensor unavailable", e)
+
         status_data = {
             "COM_PORT1": "connected" if COM_PORT1 in ports_snapshot else "disconnected",
             "COM_PORT2": "connected" if COM_PORT2 in ports_snapshot else "disconnected",
-            "CPU_Temp": round(float(open("/sys/class/thermal/thermal_zone0/temp").read()) / 1000, 1),
+            "CPU_Temp": cpu_temp,
             "LastUpdated": timestamp()
         }
 
@@ -783,6 +820,7 @@ def heartbeat_loop():
             firebase_log.info(f"Heartbeat update queued: {status_data}")
         except Exception as e:
             firebase_log.error(f"Failed to queue Firebase status: {e}")
+            report_critical_error("firebase", "Heartbeat update failed", e)
 
         time.sleep(STATUS_INTERVAL)
 

@@ -1,3 +1,4 @@
+#imports
 from datetime import datetime
 import serial
 import threading
@@ -12,12 +13,11 @@ import logging
 from logging.handlers import RotatingFileHandler
 import sys
 import re
+from wal import LocalQueue #LOCAL FILE
 
-# Import WAL module for Firebase resilience
-from wal import LocalQueue
 
 # === CONFIGURATION ===
-load_dotenv()
+load_dotenv() #load up creds
 
 # === LOGGING CONFIGURATION ===
 root_logger = logging.getLogger()
@@ -92,14 +92,16 @@ general_log.info("Logging initialized. Program has just been started. ==========
 general_log.info("===============================================================================================")
 
 # open the json and load the serial port IDS of the arduinos. change hardwareIDS.json to change your hardware ids of your arduinos.
-with open("hardwareIDS.json") as hardwareID:
+with open("hardwareIDS.json") as hardwareID: 
     RemoteID = json.load(hardwareID)
+
+#in theory the install script manages all this file creation automatically. The only file that needs to be moved is the actual firebase.json. 
 
 COM_PORT1 = RemoteID["COM_PORT1"] #init com ports
 COM_PORT2 = RemoteID["COM_PORT2"] 
-BAUD_RATE = 9600
+BAUD_RATE = 9600 #dont change this
 MATCH_WINDOW_SECONDS = 3.0 #change to adjust the window for matching slots and RFID ID numbers.
-FIREBASE_DB_BASE_URL = getenv('FIREBASE_DB_BASE_URL')
+FIREBASE_DB_BASE_URL = getenv('FIREBASE_DB_BASE_URL') #pull creds via env
 FIREBASE_CREDS_FILE = getenv('FIREBASE_CREDS_FILE')
 
 general_log.info(f"Loaded hardware IDs: {RemoteID}")
@@ -113,19 +115,36 @@ if not FIREBASE_DB_BASE_URL or not FIREBASE_CREDS_FILE:
     sys.exit(1)
 
 
-# Initialize the app with a service account, granting admin privileges
+# Initialize the app with a service account
 cred = credentials.Certificate(FIREBASE_CREDS_FILE)
 firebase_log.info("Creds loaded")
 firebase_admin.initialize_app(cred, {
     'databaseURL': FIREBASE_DB_BASE_URL
 })
 
-ref = db.reference('/')
+ref = db.reference('/') #reference the root of the database
 
 # === WRITE-AHEAD LOGGING (WAL) ===
 # Initialize local queue for Firebase resilience
 firebase_queue = LocalQueue("firebase_queue.json", firebase_log)
 firebase_log.info("Write-Ahead Logging initialized.")
+
+def report_critical_error(source, message, details=None):
+    """Publish a compact critical event for the web admin console."""
+    try:
+        error_id = str(int(time.time() * 1000))
+        event = {
+            "source": source,
+            "message": str(message),
+            "timestamp": timestamp(),
+            "severity": "critical",
+            "acknowledged": False,
+        }
+        if details:
+            event["details"] = str(details)
+        firebase_queue.enqueue(f"status/CriticalErrors/{error_id}", event, operation="update")
+    except Exception as report_error:
+        firebase_log.error(f"Failed to report critical error: {report_error}")
 
 # === STATE TRACKING ===
 slot_status = {}  # slot_id -> {"state": "PRESENT"/"REMOVED", "last_change": timestamp, "tag": optional tag}
@@ -225,8 +244,13 @@ def handle_serial(Serialport):
         try:
             raw_line = ser.readline().decode("utf-8").strip()
             serial_log.info(f"RAW LINE: '{raw_line}' from {Serialport}")
-        except Exception:
+        except UnicodeDecodeError as e:
+            serial_log.warning(f"Unicode decode error on {Serialport}: {e}")
             continue
+        except Exception as e:
+            serial_log.critical(f"Serial read error on {Serialport}: {e}. Attempting to reconnect...")
+            report_critical_error("serial", f"Serial read failed on {Serialport}", e)
+            break  # Break inner loop to trigger reconnection
         
         # --- ACK Handling ---
         if raw_line == "ACK" or raw_line == "OK":
@@ -337,6 +361,9 @@ def handle_serial(Serialport):
                         if matched_tag:
                             match_log.info(f"Tag {matched_tag} matched to slot {slot} at {timestamp(now)}")
                             slot_status[slot]["tag"] = matched_tag
+                        else:
+                            match_log.warning(f"Ignoring slot {slot} PRESENT event without a matching RFID tag")
+                            continue
                         
                         #if pending_tags changes between finding and removing it will raise value error.
                         try:
@@ -389,6 +416,13 @@ def handle_serial(Serialport):
                     firebase_log.info(f"Name Exists for ID:{matched_tag}")
 
             elif state == "REMOVED":
+                if not prev_tag and slot in startup_present_slots:
+                    startup_present_slots.discard(slot)
+                    firebase_log.info(f"Startup: untagged slot {slot} cleared")
+                    if not startup_present_slots:
+                        startup_block = False
+                        firebase_queue.enqueue("status/StartupError", False, operation="set")
+                        firebase_queue.enqueue("status/StartupErrorSlots", [], operation="set")
                 if prev_tag:
                     match_log.info(f"Tag {prev_tag} removed from slot {slot} at {timestamp(now)}")
                     slot_status[slot]["tag"] = None
@@ -503,12 +537,12 @@ def handle_serial(Serialport):
                             firebase_log.info(f"Startup: slot {slot} cleared (was present at startup)")
                             # If no more startup slots remain, clear the startup block and notify Firebase
                             if not startup_present_slots:
-                                startup_block = False
+                                startup_block = False #set false for main
                                 firebase_queue.enqueue("status/StartupError", False, operation="set")
                                 firebase_queue.enqueue("status/StartupErrorSlots", [], operation="set")
                                 firebase_log.info("Startup: all startup-present slots cleared; unblocking tag matching (queued)")
                         except Exception as e:
-                            firebase_log.error(f"Error updating startup_present_slots on removal: {e}")
+                            firebase_log.error(f"Error updating startup_present_slots on removal: {e}") #should hopefully never happen
 
 #ALEX DO NOT USE .SET ANYMORE ONLY USE .UPDATE YOU PMO - Jackson 8/7/2025
 
@@ -602,7 +636,7 @@ def listen_rfid():
             now = time.time()
             with lock:
                 pending_tags.append((tag_id, now)) #timestamp the tag scan and send it off to be matched with a slot <3
-                rfid_log.info(f"Tag Read: {tag_id} at {timestamp(now)}")
+                rfid_log.info(f"Tag Read: {tag_id} at {timestamp(now)}") #stamp it
         else:
             rfid_log.warning(f"Ignored invalid input: {tag_buffer}") #log it
             tag_buffer = "" #clear the buffer
@@ -617,7 +651,7 @@ def led_manager_loop():
         with serial_ports_lock:
             ser = serial_ports.get(COM_PORT1) #we have to share the com port so we are just waiting for the parent function (handle_serial) to open the serial interface
         if ser:
-            break
+            break #get out when its detected
         led_log.debug("Waiting for COM_PORT1 to be opened by handle_serial...")
         time.sleep(0.5) #dont spam
 
@@ -627,108 +661,112 @@ def led_manager_loop():
         return ack_received.wait(timeout=timeout)
 
     while True:
-        loop_start = time.time()
-
-        if (time.time() - last_heartbeat) >= HEARTBEAT_INTERVAL:
-            safe_write_serial(COM_PORT1, "PING\n")
-            last_heartbeat = time.time()
-            led_log.debug("PING sent") 
-
         try:
-            min_time_setting = int(ref.child('Settings/minTime').get() or 0) #pull min time setting for rendering the LEDS
-        except Exception:
-            min_time_setting = 0
+            loop_start = time.time()
 
-        # Snapshot shared runtime state once per loop for thread-safety
-        with lock:
-            local_slot_status = dict(slot_status)
-            local_startup_block = startup_block
-            local_startup_present = set(startup_present_slots)
+            if (time.time() - last_heartbeat) >= HEARTBEAT_INTERVAL:
+                safe_write_serial(COM_PORT1, "PING\n")
+                last_heartbeat = time.time()
+                led_log.debug("PING sent") 
 
-        #Pull charging status directly from BatteryList
-        batteries_ref = db.reference("BatteryList") 
-        batteries = batteries_ref.get() or {} 
+            try:
+                min_time_setting = int(ref.child('Settings/minTime').get() or 0) #pull min time setting for rendering the LEDS
+            except Exception:
+                min_time_setting = 0
 
-        # Build mapping of slot -> (tag, battery_data)
-        slot_to_battery = {}
-        for tag, data in batteries.items():
-            if not isinstance(data, dict): 
-                continue
-            if data.get("IsCharging") and data.get("ChargingSlot") is not None: #if its currently charging
-                slot_to_battery[data["ChargingSlot"]] = (tag, data)
-                led_log.info(f"Battery {tag} in slot {data['ChargingSlot']} is charging")
+            # Snapshot shared runtime state once per loop for thread-safety
+            with lock:
+                local_slot_status = dict(slot_status)
+                local_startup_block = startup_block
+                local_startup_present = set(startup_present_slots)
 
-        # Iterate through all slots
-        slot_evaluations = {}
-        for slot in range(7):
-            entry = {"state": "AVAILABLE", "tag": None, "elapsed": None}
-            if slot in slot_to_battery:
-                tag, bdata = slot_to_battery[slot]
-                entry["state"] = "PRESENT"
-                entry["tag"] = tag
-                cst = bdata.get("ChargingStartTime")
-                epoch = parse_timestamp_to_epoch(cst) if cst else None
-                if epoch:
-                    entry["elapsed"] = time.time() - epoch
-            slot_evaluations[slot] = entry
+            #Pull charging status directly from BatteryList
+            batteries_ref = db.reference("BatteryList") 
+            batteries = batteries_ref.get() or {} 
 
-        
-        pickNextSlot(slot_evaluations, min_time_setting)
-        nextup = pickNextSlot(slot_evaluations, min_time_setting)
-        led_log.info(f"Next slot to pick: {nextup}")
+            # Build mapping of slot -> (tag, battery_data)
+            slot_to_battery = {}
+            for tag, data in batteries.items():
+                if not isinstance(data, dict): 
+                    continue
+                if data.get("IsCharging") and data.get("ChargingSlot") is not None: #if its currently charging
+                    slot_to_battery[data["ChargingSlot"]] = (tag, data)
+                    led_log.info(f"Battery {tag} in slot {data['ChargingSlot']} is charging")
 
-        
-        
+            # Iterate through all slots
+            slot_evaluations = {}
+            for slot in range(7):
+                entry = {"state": "AVAILABLE", "tag": None, "elapsed": None}
+                if slot in slot_to_battery:
+                    tag, bdata = slot_to_battery[slot]
+                    entry["state"] = "PRESENT"
+                    entry["tag"] = tag
+                    cst = bdata.get("ChargingStartTime")
+                    epoch = parse_timestamp_to_epoch(cst) if cst else None
+                    if epoch:
+                        entry["elapsed"] = time.time() - epoch
+                slot_evaluations[slot] = entry
 
-        for slot in range(7):
-            ev = slot_evaluations[slot]
-            # If we are in startup blocking mode and this slot was present at startup,
-            # make it flash red to indicate it must be cleared before matching.
-            if local_startup_block and slot in local_startup_present:
-                mode, hue = "DEEPPULSE", HUE_RED
-            else:
-                if ev["state"] == "AVAILABLE":
-                    mode, hue = "PULSE", HUE_ORANGE #slot is available
-                elif ev["state"] == "PRESENT":
-                    if ev["elapsed"] and ev["elapsed"] >= min_time_setting:
-                        if slot == nextup:
-                            mode, hue = "DEEPPULSE", HUE_GREEN #pick this next
-                        else:
-                            mode, hue = "SOLID", HUE_BLUE #charged, but not the best available
-                    else:
-                        mode, hue = "SOLID", HUE_RED #currently charging
+            pickNextSlot(slot_evaluations, min_time_setting)
+            nextup = pickNextSlot(slot_evaluations, min_time_setting)
+            led_log.info(f"Next slot to pick: {nextup}")
+
+            for slot in range(7):
+                ev = slot_evaluations[slot]
+                # If we are in startup blocking mode and this slot was present at startup,
+                # make it flash red to indicate it must be cleared before matching.
+                if local_startup_block and slot in local_startup_present:
+                    mode, hue = "DEEPPULSE", HUE_RED
                 else:
-                    mode, hue = "PULSE", HUE_ORANGE #i dont think this matters but it makes the code look cooler
-
-            pos = POSITIONS[slot] if slot < len(POSITIONS) else 0
-            this_cmd = (mode, hue, pos)
-            last = last_sent_command.get(slot)
-
-            if this_cmd != last: #just make sure we are not repeating commands
-                cmd_str = f"SEG {slot} POS {pos} COLOR {hue} MODE {mode}\n" #sets the command format
-                retries = 0
-                while retries < MAX_RETRIES: #retry logic
-                    if safe_write_serial(COM_PORT1, cmd_str):
-                        led_log.info(f"Sent: {cmd_str.strip()} (attempt {retries+1})")
-                        if wait_for_ack():
-                            last_sent_command[slot] = this_cmd
-                            break
+                    if ev["state"] == "AVAILABLE":
+                        mode, hue = "PULSE", HUE_ORANGE #slot is available
+                    elif ev["state"] == "PRESENT":
+                        if ev["elapsed"] and ev["elapsed"] >= min_time_setting:
+                            if slot == nextup:
+                                mode, hue = "DEEPPULSE", HUE_GREEN #pick this next
+                            else:
+                                mode, hue = "SOLID", HUE_BLUE #charged, but not the best available
                         else:
-                            retries += 1
-                            led_log.warning(f"No ACK received for slot {slot}, retrying ({retries}/{MAX_RETRIES})...")
-                            time.sleep(0.2)
+                            mode, hue = "SOLID", HUE_RED #currently charging
                     else:
-                        led_log.error(f"Failed to send command for slot {slot}")
-                        break
-                if retries >= MAX_RETRIES:
-                    led_log.critical(f"Failed to confirm slot {slot} command after {MAX_RETRIES} attempts. Critical error, LEDs may be out of sync.")
-                    led_log.warning("LEDS OUT OF SYNC")
+                        mode, hue = "PULSE", HUE_ORANGE #i dont think this matters but it makes the code look cooler
 
-            time.sleep(0.1)
+                pos = POSITIONS[slot] if slot < len(POSITIONS) else 0
+                this_cmd = (mode, hue, pos)
+                last = last_sent_command.get(slot)
 
-        elapsed = time.time() - loop_start
-        sleep_time = max(0, POLL_INTERVAL - elapsed)
-        time.sleep(sleep_time)
+                if this_cmd != last: #just make sure we are not repeating commands
+                    cmd_str = f"SEG {slot} POS {pos} COLOR {hue} MODE {mode}\n" #sets the command format
+                    retries = 0
+                    while retries < MAX_RETRIES: #retry logic
+                        if safe_write_serial(COM_PORT1, cmd_str):
+                            led_log.info(f"Sent: {cmd_str.strip()} (attempt {retries+1})")
+                            if wait_for_ack():
+                                last_sent_command[slot] = this_cmd
+                                break
+                            else:
+                                retries += 1
+                                led_log.warning(f"No ACK received for slot {slot}, retrying ({retries}/{MAX_RETRIES})...")
+                                time.sleep(0.2)
+                        else:
+                            led_log.error(f"Failed to send command for slot {slot}")
+                            break
+                    if retries >= MAX_RETRIES:
+                        led_log.critical(f"Failed to confirm slot {slot} command after {MAX_RETRIES} attempts. Critical error, LEDs may be out of sync.")
+                        report_critical_error("led", f"LED command failed for slot {slot}", f"Command: {cmd_str.strip()}")
+                        led_log.warning("LEDS OUT OF SYNC")
+
+                time.sleep(0.1)
+
+            elapsed = time.time() - loop_start
+            sleep_time = max(0, POLL_INTERVAL - elapsed)
+            time.sleep(sleep_time)
+        except Exception as e:
+            led_log.critical(f"LED manager crashed: {e}")
+            import traceback
+            led_log.critical(traceback.format_exc())
+            report_critical_error("led", "LED manager crashed", e)
+            time.sleep(5)  # Wait before retrying to avoid spam
 
 def pickNextSlot(slot_evaluations, min_time_setting):
     fully_charged = [
@@ -764,10 +802,16 @@ def heartbeat_loop():
         with serial_ports_lock:
             ports_snapshot = dict(serial_ports)
 
+        try:
+            cpu_temp = round(float(open("/sys/class/thermal/thermal_zone0/temp").read()) / 1000, 1)
+        except Exception as e:
+            cpu_temp = None
+            report_critical_error("pi", "CPU temperature sensor unavailable", e)
+
         status_data = {
             "COM_PORT1": "connected" if COM_PORT1 in ports_snapshot else "disconnected",
             "COM_PORT2": "connected" if COM_PORT2 in ports_snapshot else "disconnected",
-            "CPU_Temp": round(float(open("/sys/class/thermal/thermal_zone0/temp").read()) / 1000, 1),
+            "CPU_Temp": cpu_temp,
             "LastUpdated": timestamp()
         }
 
@@ -776,6 +820,7 @@ def heartbeat_loop():
             firebase_log.info(f"Heartbeat update queued: {status_data}")
         except Exception as e:
             firebase_log.error(f"Failed to queue Firebase status: {e}")
+            report_critical_error("firebase", "Heartbeat update failed", e)
 
         time.sleep(STATUS_INTERVAL)
 
@@ -801,17 +846,18 @@ def wal_retry_loop():
 
 if __name__ == "__main__":
     # At startup, block matching until we scan for any present batteries reported by the hardware
-    startup_block = True
+    startup_block = True #block statuses until this has been flagged as false. Only needs to happen on startup, otherwise the pi can track everything super well. 
+    # startup block prevents missed charging events by forcing the user to remove all batteries on the charger and replacing them. 
+    # we cannot force the readers to re-output their IDS. it only happens on first presence. This is why this is needed. If it didnt exist, then batteries that
+    # are already on the charger will not exist in db, because the readers will scan before we can log it and post to db.
     firebase_log.info("Startup: enabling startup_block to detect any present batteries before allowing matching")
+    firebase_log.info(f"startup block is set to: {startup_block}") #log the present status
 
-    # Start serial handler threads which will populate startup_present_slots if any PRESENCE messages arrive
+    # create all our threads. This is called threadlocking and is good for this program. google it idk how it works.
     threading.Thread(target=handle_serial, args=(COM_PORT1,), daemon=True).start() #args is now the com port for each arduino, kept in hardwareIDS.json. This is so we can listen to both arduinos
     threading.Thread(target=handle_serial, args=(COM_PORT2,), daemon=True).start()
-
-    # Start the LED manager thread (reads DB and writes LED commands using the same COM_PORT1 serial object)
     threading.Thread(target=led_manager_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
-    # Start the WAL retry thread to handle queued Firebase operations
     threading.Thread(target=wal_retry_loop, daemon=True).start()
 
     # Give the serial handlers a short window to report current slot PRESENCE states

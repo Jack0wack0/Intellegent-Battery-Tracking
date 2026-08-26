@@ -4,12 +4,6 @@ Write-Ahead Logging (WAL) module for MachineA Battery Cart.
 This module provides a LocalQueue that persists pending Firebase updates to disk
 before attempting to upload them. If the Pi loses internet connection, the queue
 is preserved and will retry on reconnection.
-
-Usage:
-    from wal import LocalQueue
-    queue = LocalQueue("firebase_queue.json")
-    queue.enqueue("BatteryList/BAT123", {"IsCharging": True, "ChargingSlot": 2})
-    queue.process(firebase_ref, logger)  # attempts to upload all queued items
 """
 
 import json

@@ -328,12 +328,6 @@ def handle_serial(Serialport):
                         matched_tag = resumed_tag
                         match_log.info(f"Tag {matched_tag} resumed charging in slot {slot}")
                         slot_status[slot]["tag"] = matched_tag
-                        # Re-add to CurrentChargingList and update BatteryList (resume operation)
-                        firebase_queue.enqueue('CurrentChargingList/' + matched_tag, {
-                            'ID': matched_tag,
-                            'ChargingStartTime': timestamp(now),
-                        }, operation="update")
-                        firebase_log.debug(f"Resumed charging for {matched_tag} (queued)")
                         # Update BatteryList to mark as actively charging again
                         firebase_queue.enqueue('BatteryList/' + matched_tag, {
                             'ID': matched_tag,
@@ -346,8 +340,14 @@ def handle_serial(Serialport):
                         # Normal matching: Try to match with pending RFID tag
                         matched_tag = None
                         matched_time = None
-                        time.sleep(1) #wait for the keyboard input from the rfid reader to be processed, then match it with the slot.
-                        
+                        # Release the shared lock while waiting for the RFID buffer to catch up so the
+                        # other Arduino's thread (and any REMOVED events) aren't blocked for a full second.
+                        lock.release()
+                        try:
+                            time.sleep(1) #wait for the keyboard input from the rfid reader to be processed, then match it with the slot.
+                        finally:
+                            lock.acquire()
+
                         for tag, t_time in pending_tags:
                             match_log.debug(f"Comparing tag time {timestamp(t_time)} to slot time {timestamp(now)}")
                             if abs(now - t_time) <= MATCH_WINDOW_SECONDS:
@@ -371,13 +371,6 @@ def handle_serial(Serialport):
                         except ValueError:
                             pass
                         
-                        #Add the newly scanned battery/tag to the 'CurrentChargingList' to show as actively charging
-                        #this could possibly be removed as i can just look at IsCharging: True. 
-                        firebase_queue.enqueue('CurrentChargingList/' + matched_tag, {
-                            'ID': matched_tag,
-                            'ChargingStartTime': timestamp(now), #Use this timestamp to later determine how long it's been charging for
-                        }, operation="update")
-                        firebase_log.debug("Added to CurrentChargingList (queued)")
                         #Pull all records of charging for this battery/tag
                         getCurrentChargingRecords = ref.child('BatteryList/' + matched_tag + '/ChargingRecords').get()
 
@@ -431,7 +424,10 @@ def handle_serial(Serialport):
                     recent_removals[(slot, prev_tag)] = now
                     match_log.debug(f"Tracked removal: slot {slot}, tag {prev_tag} at {timestamp(now)} (grace period: {REMOVAL_GRACE_PERIOD}s)")
                     
-                    # Schedule a background task to finalize the removal after grace period
+                    # Schedule a background task to finalize the removal after grace period.
+                    # This is the ONLY place finalization happens for a removal - if the tag returns
+                    # within the grace period (flickering_resume above), this thread bails out because
+                    # the (slot, tag) entry gets deleted from recent_removals before it fires.
                     def finalize_removal_after_grace_period(slot_num, tag_id, removal_t):
                         time.sleep(REMOVAL_GRACE_PERIOD)
                         with lock:
@@ -449,100 +445,23 @@ def handle_serial(Serialport):
                             finalize_charging_removal(tag_id, slot_num, removal_t)
                         except Exception as e:
                             firebase_log.error(f"Error finalizing removal for {tag_id}: {e}")
+                        # If this slot was marked as present at startup, remove it from the startup_present_slots set
+                        with lock:
+                            if slot_num in startup_present_slots:
+                                try:
+                                    startup_present_slots.discard(slot_num)
+                                    firebase_log.info(f"Startup: slot {slot_num} cleared (was present at startup)")
+                                    if not startup_present_slots:
+                                        global startup_block
+                                        startup_block = False
+                                        firebase_queue.enqueue("status/StartupError", False, operation="set")
+                                        firebase_queue.enqueue("status/StartupErrorSlots", [], operation="set")
+                                        firebase_log.info("Startup: all startup-present slots cleared; unblocking tag matching (queued)")
+                                except Exception as e:
+                                    firebase_log.error(f"Error updating startup_present_slots on removal: {e}") #should hopefully never happen
                     
                     threading.Thread(target=finalize_removal_after_grace_period, args=(slot, prev_tag, now), daemon=True).start()
                     firebase_log.debug(f"Scheduled finalization thread for tag {prev_tag} after grace period")
-                    
-                    # Immediately remove from CurrentChargingList (visual feedback)
-                    firebase_queue.enqueue('CurrentChargingList/' + prev_tag, None, operation="delete")
-                    firebase_log.info("Removed from CurrentChargingList (queued)")
-
-                    #Get the current (Now removed) charging slot for this battery/tag
-                    chargingSlot = ref.child(f'BatteryList/{prev_tag}/ChargingSlot').get()
-
-                    #Pull all records of charging for this battery/tag
-                    getCurrentChargingRecords = ref.child('BatteryList/' + prev_tag + '/ChargingRecords').get()
-
-                    #Count the number of existing records to determine the ID of the most recent record
-                    count = len(getCurrentChargingRecords) if getCurrentChargingRecords else 0 #Set to 0 if this is the first record for firebase 'array'
-                    startTime = ref.child(f'BatteryList/{prev_tag}/ChargingRecords/{count-1}/StartTime').get() #Pull the start time of the most recent record to determine duration
-                    endTime = timestamp(now) #Set the end time as now since it's just been removed
-                    endTimeStamp = timestamp(now) #Set the end time as now since it's just been removed
-                    endTime = datetime.strptime(endTime, "%Y-%m-%d %H:%M:%S") #Convert to datetime object
-                    startTime = datetime.strptime(startTime, "%Y-%m-%d %H:%M:%S") #Convert to datetime object
-                    duration = endTime - startTime #Determine the duration between start and end time 
-                    firebase_log.debug(f"Duration for {prev_tag} was {duration}")
-
-                    #Update the most recent record with the end time and duration, count-1 is used to get the most recent record since arrays are 0 indexed in Firebase
-                    firebase_queue.enqueue(f'BatteryList/{prev_tag}/ChargingRecords/{count-1}', {
-                        'EndTime': endTimeStamp, 
-                        'Duration': str(duration.total_seconds())[:-2]
-                    }, operation="update")
-                    firebase_log.debug(f"Charging record update queued for {prev_tag}")
-
-                    #Remove the last record from the array to prevent it from being counted twice
-                    #This last record is the one just updated, however is currently stored locally without duration/endtime
-                    #Basically, remove the incomplete record from the local copy of the records array to then later add the completed record locally
-                    del getCurrentChargingRecords[-1]
-
-                    #Due to not waiting on confirmation from firebase that the above update has been made, manually append the end time and duration to the local copy of the records array
-                    getCurrentChargingRecords.append({'StartTime': startTime,'EndTime': endTime,'Duration': str(duration.total_seconds())[:-2]})
-                    firebase_log.info(f"Updated record for {prev_tag} with end time and duration")
-
-                    #Calculate the overall charge time and average charge time
-                    #Note, everything is in SECONDS
-                    overallDuration = 0
-                    avgDuration = 0
-                    totalCycles = 0 #Get the total number of cycles for this battery/tag
-                    minTimeSetting = ref.child(f'Settings/minTime').get() #Get the minimum time settings for the battery.
-                    firebase_log.debug(f"Pulled Minimum Time Setting {minTimeSetting} seconds")
-                    for record in getCurrentChargingRecords: #Loop through all records for this battery/tag
-                        
-                        if float(record['Duration']) >= int(minTimeSetting): #Only count records that are above the minimum time setting
-                            totalCycles += 1 #Increment the total cycles for this battery/tag
-                            overallDuration += int(record.get('Duration')) #Overall charge time is the sum of all durations in the records array
-
-                    if totalCycles > 0:    
-                      avgDuration = overallDuration/totalCycles   #Average charge time is the overall charge time divided by the number of cycles
-                      avgDuration = "{:.0f}".format(avgDuration) #Format to remove decimal places, this also rounds DOWN by removing the decimal places
-
-                    if int(str(duration.total_seconds())[:-2]) < int(minTimeSetting):
-                        ref.child('BatteryList/' + prev_tag).update({
-                        'ID': prev_tag,
-                        'IsCharging': False, #Set charging as false
-                        'ChargingSlot': None, #Remove the ChargingSlot as it's no longer charging
-                        'LastChargingSlot': chargingSlot, #Set the last charging slot to the current slot it was charging in
-                        'TotalCycles' : totalCycles, #Total number of charge cycles for this battery/tag
-                        'AverageChargeTime': avgDuration, #Average charge time in seconds
-                        'OverallChargeTime': overallDuration, #Overall lifetime charge time in seconds
-                    })
-                    else:
-                        ref.child('BatteryList/' + prev_tag).update({
-                        'ID': prev_tag,
-                        'IsCharging': False, #Set charging as false
-                        'ChargingSlot': None, #Remove the ChargingSlot as it's no longer charging
-                        'LastChargingSlot': chargingSlot, #Set the last charging slot to the current slot it was charging in
-                        'ChargingEndTime': timestamp(now), #When was the most recent time it was on a charger
-                        'ChargingStartTime': None, #Remove the ChargingStartTime as it's no longer charging
-                        'LastOverallChargeTime': str(duration.total_seconds())[:-2], #Set the last overall charge time to the duration of the most recent charge 
-                        'TotalCycles' : totalCycles, #Total number of charge cycles for this battery/tag
-                        'AverageChargeTime': avgDuration, #Average charge time in seconds
-                        'OverallChargeTime': overallDuration, #Overall lifetime charge time in seconds
-                    })
-
-                    # If this slot was marked as present at startup, remove it from the startup_present_slots set
-                    if slot in startup_present_slots:
-                        try:
-                            startup_present_slots.discard(slot)
-                            firebase_log.info(f"Startup: slot {slot} cleared (was present at startup)")
-                            # If no more startup slots remain, clear the startup block and notify Firebase
-                            if not startup_present_slots:
-                                startup_block = False #set false for main
-                                firebase_queue.enqueue("status/StartupError", False, operation="set")
-                                firebase_queue.enqueue("status/StartupErrorSlots", [], operation="set")
-                                firebase_log.info("Startup: all startup-present slots cleared; unblocking tag matching (queued)")
-                        except Exception as e:
-                            firebase_log.error(f"Error updating startup_present_slots on removal: {e}") #should hopefully never happen
 
 #ALEX DO NOT USE .SET ANYMORE ONLY USE .UPDATE YOU PMO - Jackson 8/7/2025
 
@@ -559,6 +478,19 @@ def finalize_charging_removal(tag_id, slot_num, removal_timestamp):
 
     #Count the number of existing records to determine the ID of the most recent record
     count = len(getCurrentChargingRecords) if getCurrentChargingRecords else 0 #Set to 0 if this is the first record for firebase 'array'
+    if count == 0:
+        # No open charging record to close out - nothing to finalize, but still make sure
+        # the battery isn't left stuck showing as charging.
+        firebase_log.error(f"No ChargingRecords found for {tag_id} on removal; clearing IsCharging without a duration.")
+        ref.child('BatteryList/' + tag_id).update({
+            'ID': tag_id,
+            'IsCharging': False,
+            'ChargingSlot': None,
+            'LastChargingSlot': chargingSlot,
+            'ChargingEndTime': timestamp(now),
+            'ChargingStartTime': None,
+        })
+        return
     startTime = ref.child(f'BatteryList/{tag_id}/ChargingRecords/{count-1}/StartTime').get() #Pull the start time of the most recent record to determine duration
     endTime = timestamp(now) #Set the end time as now since it's just been removed
     endTimeStamp = timestamp(now) #Set the end time as now since it's just been removed
@@ -588,11 +520,14 @@ def finalize_charging_removal(tag_id, slot_num, removal_timestamp):
     overallDuration = 0
     avgDuration = 0
     totalCycles = 0 #Get the total number of cycles for this battery/tag
-    minTimeSetting = ref.child(f'Settings/minTime').get() #Get the minimum time settings for the battery.
+    try:
+        minTimeSetting = int(ref.child('Settings/minTime').get() or 0) #Get the minimum time settings for the battery. Default to 0 if missing/invalid so we never crash this thread.
+    except (TypeError, ValueError):
+        minTimeSetting = 0
     firebase_log.debug(f"Pulled Minimum Time Setting {minTimeSetting} seconds")
     for record in getCurrentChargingRecords: #Loop through all records for this battery/tag
         
-        if float(record['Duration']) >= int(minTimeSetting): #Only count records that are above the minimum time setting
+        if float(record['Duration']) >= minTimeSetting: #Only count records that are above the minimum time setting
             totalCycles += 1 #Increment the total cycles for this battery/tag
             overallDuration += int(record.get('Duration')) #Overall charge time is the sum of all durations in the records array
 
@@ -600,7 +535,7 @@ def finalize_charging_removal(tag_id, slot_num, removal_timestamp):
       avgDuration = overallDuration/totalCycles   #Average charge time is the overall charge time divided by the number of cycles
       avgDuration = "{:.0f}".format(avgDuration) #Format to remove decimal places, this also rounds DOWN by removing the decimal places
 
-    if int(str(duration.total_seconds())[:-2]) < int(minTimeSetting):
+    if int(str(duration.total_seconds())[:-2]) < minTimeSetting:
         ref.child('BatteryList/' + tag_id).update({
         'ID': tag_id,
         'IsCharging': False, #Set charging as false

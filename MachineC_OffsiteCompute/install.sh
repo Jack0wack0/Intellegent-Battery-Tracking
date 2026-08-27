@@ -135,9 +135,33 @@ else
   echo "[i] $CHECK_TIMER already exists — skipping"
 fi
 
+echo "[i] Creating systemd service for the battery scoring engine (long-running)"
+SCORING_SERVICE_FILE=/etc/systemd/system/offsite-scoring-engine.service
+if [ ! -f "$SCORING_SERVICE_FILE" ]; then
+  sudo bash -c "cat > $SCORING_SERVICE_FILE" <<EOF
+[Unit]
+Description=Offsite Battery Health & Match Scoring Engine
+After=network.target
+
+[Service]
+User=$CURRENT_USER
+WorkingDirectory=$MACHINE_DIR
+ExecStart=$VENV_DIR/bin/python3 -m battery_scoring.engine
+Restart=on-failure
+EnvironmentFile=$MACHINE_DIR/.env
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  echo "[i] Created $SCORING_SERVICE_FILE"
+else
+  echo "[i] $SCORING_SERVICE_FILE already exists — skipping creation"
+fi
+
 echo "[i] Reloading systemd daemon and enabling services/timers"
 sudo systemctl daemon-reload
 sudo systemctl enable --now offsite-firebase-scraper.service || true
+sudo systemctl enable --now offsite-scoring-engine.service || true
 sudo systemctl enable --now offsite-check.timer || true
 
 echo "[✓] Installation complete."

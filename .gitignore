@@ -2,3 +2,17 @@ MachineC_OffsiteCompute/battery-tracking-d38fc-firebase-adminsdk-fbsvc-47e87dc99
 Correction.log
 .DS_Store
 log.txt
+
+# Local-only dev environments/artifacts (not part of what gets deployed to any machine)
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+
+# Credentials/secrets -- never commit these regardless of which folder they land in
+.env
+.env.*
+*.pickle
+firebase_queue.json

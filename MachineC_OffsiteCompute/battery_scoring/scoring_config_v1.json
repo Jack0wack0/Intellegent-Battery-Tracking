@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "match_score": {
+    "weights": {
+      "voltage": 0.45,
+      "soc": 0.15,
+      "internal_resistance": 0.20,
+      "voltage_18a": 0.20
+    },
+    "voltage_range": { "min": 11.6, "max": 12.9 },
+    "soc_range": { "min": 20, "max": 100 },
+    "internal_resistance_range_milliohm": { "good": 8, "bad": 25 },
+    "voltage_18a_range": { "min": 9.0, "max": 12.5 },
+    "freshness_hours": {
+      "full_weight_within": 2,
+      "zero_weight_after": 72
+    }
+  },
+  "health_score": {
+    "weights": {
+      "internal_resistance_trend": 0.30,
+      "capacity_soh": 0.30,
+      "voltage_18a_trend": 0.20,
+      "age_and_cycles": 0.20
+    },
+    "baseline_sample_size": 5,
+    "recent_sample_size": 5,
+    "internal_resistance_change_range_pct": { "good": 5, "bad": 50 },
+    "voltage_18a_change_range_pct": { "good": -3, "bad": -25 },
+    "capacity_soh_range_pct": { "good": 90, "bad": 60 },
+    "age_days_range": { "full_score": 0, "zero_score": 1460 },
+    "cycles_range": { "full_score": 0, "zero_score": 600 },
+    "min_points_for_trend": 3
+  },
+  "notes": "Initial, conservative defaults. Not scientifically validated FRC thresholds -- recalibrate against real battery/robot data and bump 'version' when changed. See Shared/battery_schema.md."
+}

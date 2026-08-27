@@ -619,6 +619,13 @@ def led_manager_loop():
             batteries_ref = db.reference("BatteryList") 
             batteries = batteries_ref.get() or {} 
 
+            # Pull cached Match Scores (written by the offsite scoring engine) so the "next up"
+            # pick can be ranked by match-readiness instead of just charge duration.
+            try:
+                battery_metadata = db.reference("Batteries").get() or {}
+            except Exception:
+                battery_metadata = {}
+
             # Build mapping of slot -> (tag, battery_data)
             slot_to_battery = {}
             for tag, data in batteries.items():
@@ -642,8 +649,7 @@ def led_manager_loop():
                         entry["elapsed"] = time.time() - epoch
                 slot_evaluations[slot] = entry
 
-            pickNextSlot(slot_evaluations, min_time_setting)
-            nextup = pickNextSlot(slot_evaluations, min_time_setting)
+            nextup = pickNextSlot(slot_evaluations, min_time_setting, battery_metadata)
             led_log.info(f"Next slot to pick: {nextup}")
 
             for slot in range(7):
@@ -703,19 +709,43 @@ def led_manager_loop():
             report_critical_error("led", "LED manager crashed", e)
             time.sleep(5)  # Wait before retrying to avoid spam
 
-def pickNextSlot(slot_evaluations, min_time_setting):
+def pickNextSlot(slot_evaluations, min_time_setting, battery_metadata=None):
+    battery_metadata = battery_metadata or {}
+
+    def is_retired(tag):
+        record = battery_metadata.get(tag)
+        return isinstance(record, dict) and bool(record.get("retirementDate"))
+
+    # Retired batteries still charge normally (LED shows solid blue once charged) but are never
+    # recommended as the next pick -- they're treated as misc batteries, not part of the queue.
     fully_charged = [
-        (s, e["elapsed"]) for s, e in slot_evaluations.items()
+        (s, e["tag"], e["elapsed"]) for s, e in slot_evaluations.items()
         if e["state"] == "PRESENT" and e["elapsed"] and e["elapsed"] >= min_time_setting
+        and not is_retired(e["tag"])
     ]
 
     if not fully_charged:
-        led_log.info("No fully charged slots available.")
+        led_log.info("No fully charged, non-retired slots available; clearing BatteryNextUp.")
+        try:
+            firebase_queue.enqueue("BatteryNextUp", {"BatteryNext": None, "Slot": None}, operation="set")
+            led_log.info("Cleared Firebase: BatteryNextUp (queued)")
+        except Exception as e:
+            led_log.error(f"Failed to clear BatteryNextUp: {e}")
         return None
 
-    pick_next_slot = max(fully_charged, key=lambda x: x[1])[0]
-    tag = slot_evaluations[pick_next_slot]["tag"]
-    led_log.info(f"Next slot to pick: {pick_next_slot} (Tag: {tag})")
+    def match_score_for(tag):
+        record = battery_metadata.get(tag)
+        if not isinstance(record, dict):
+            return None
+        return record.get("cache", {}).get("latestMatchScore")
+
+    # Rank by Match Score (highest wins); batteries without a score yet fall back to the
+    # longest-elapsed charge as a tiebreaker so there's still a sane pick before scores exist.
+    pick_next_slot, tag, _ = max(
+        fully_charged,
+        key=lambda item: (match_score_for(item[1]) is not None, match_score_for(item[1]) or 0, item[2]),
+    )
+    led_log.info(f"Next slot to pick: {pick_next_slot} (Tag: {tag}, Match Score: {match_score_for(tag)})")
 
     try:
         firebase_queue.enqueue("BatteryNextUp", {

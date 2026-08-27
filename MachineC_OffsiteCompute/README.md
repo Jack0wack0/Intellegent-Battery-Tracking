@@ -19,6 +19,50 @@ This component downloads Drive logs (.dslog and .dsevents) from a Google Drive f
 - `parser.py` — small helpers used for `.dsevents` parsing and DSLog parsing utilities.
 - `filter_csv.py` — CSV post-processing script.
 - `dslogtocsvlibrary/` — local library used by `DSConverter.py` to parse binary `.dslog` files.
+- `battery_scoring/` — Match Score / Health Score calculation engine (see below).
+
+## Battery Health & Match Scoring engine
+
+`battery_scoring/` implements the data model and scoring calculators from
+`FRC_Battery_Health_and_Match_Scoring_Specification.docx` (see
+[Shared/battery_schema.md](../Shared/battery_schema.md) for the full Firebase
+RTDB schema). This runs entirely on MachineC so the Raspberry Pi cart never has
+to do scoring computation or make extra Firebase round-trips for it.
+
+- `models.py` — typed views over the raw `PullMeasurements` / `CBATests` /
+  `Batteries` Firebase records.
+- `score_utils.py` — normalization/freshness-decay/weighted-average helpers.
+- `match_score.py` — Match Score: readiness for the next match, driven by
+  required current voltage plus optional Battery Beak readings.
+- `health_score.py` — Health Score: long-term degradation using
+  internal-resistance/load-voltage trends, CBA capacity SOH, and age/cycles.
+- `scoring_config_v1.json` — versioned weights/thresholds. Nothing is
+  hard-coded; recalibrate by editing this file and bumping `version` (add a
+  new `scoring_config_v{N}.json` and update `CURRENT_VERSION` in `config.py`).
+- `firebase_store.py` — RTDB read/write helpers (`Batteries`, `Cycles`,
+  `PullMeasurements`, `CBATests`, `ScoreSnapshots`).
+- `engine.py` — long-running service: does a full recompute for every
+  enrolled battery on startup, then listens for new `PullMeasurements`/
+  `CBATests` writes and recomputes just the affected battery, writing a new
+  `ScoreSnapshots` entry and refreshing the cached fields under
+  `Batteries/{id}/cache`.
+
+Run it manually for testing:
+
+```bash
+source venv/bin/activate
+python3 -m battery_scoring.engine
+```
+
+The installer creates and enables `offsite-scoring-engine.service` for
+always-on operation; check logs with:
+
+```bash
+sudo journalctl -u offsite-scoring-engine.service -f
+```
+
+Uses the same `FIREBASE_DB_BASE_URL` / `FIREBASE_CREDS_FILE` environment
+variables as `FirebaseScraper.py`.
 
 ## Prerequisites
 

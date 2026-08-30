@@ -4,6 +4,8 @@ google-auth-oauthlib
 google-auth-httplib2
 python-dotenv
 firebase-admin
+pytz
+dslogparser
 
 # Notes:
 # - `dslogtocsvlibrary` is included in this repository (local), so it is not required from PyPI.

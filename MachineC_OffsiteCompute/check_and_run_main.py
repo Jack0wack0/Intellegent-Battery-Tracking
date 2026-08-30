@@ -20,6 +20,8 @@ try:
 except Exception as e:
     print(f"[!] Failed to import drive helpers: {e}")
     sys.exit(1)
+    
+#testing if commit service is working on other machine. 
 
 
 def read_exclusions(path):

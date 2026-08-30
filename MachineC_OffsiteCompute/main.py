@@ -3,6 +3,7 @@ import os
 import time
 import shutil
 import subprocess
+import sys
 from drive_sync import get_service, list_new_files, download_file, get_folder_id_by_name
 from dotenv import load_dotenv
 from parser import parse_dsevents
@@ -19,7 +20,7 @@ LOCAL_STORAGE = os.getenv('LOCAL_STORAGE_PATH', '/mnt/storage/csvlogs')  # Chang
 def run_dsconverter(dslog_dir):
     # Run DSConverter.py to process all .dslog files in dslog_dir
     # Pass the directory where .dslog files were downloaded so DSConverter processes them
-    subprocess.run(["python3", "DSConverter.py", dslog_dir], check=True)
+    subprocess.run([sys.executable, "DSConverter.py", dslog_dir], check=True)
 
 def copy_and_verify(src, dst):
     shutil.copy2(src, dst)

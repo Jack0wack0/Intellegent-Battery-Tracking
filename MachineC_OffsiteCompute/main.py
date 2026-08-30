@@ -23,7 +23,7 @@ def run_dsconverter(dslog_dir):
     subprocess.run([sys.executable, "DSConverter.py", dslog_dir], check=True)
 
 def copy_and_verify(src, dst):
-    shutil.copy2(src, dst)
+    shutil.copy(src, dst)
     # Verify by comparing file sizes
     return os.path.getsize(src) == os.path.getsize(dst)
 

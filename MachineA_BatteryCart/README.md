@@ -58,6 +58,7 @@ This component is part of an intelligent battery tracking system designed to mon
 
 4. Make the install script executable and run it:
    ```bash
+   cd MachineA_BatteryCart
    chmod +x install.sh
    ./install.sh
    ```

@@ -45,10 +45,41 @@ GOOGLE_CREDS_PATH=creds/credentials.json
 GOOGLE_TOKEN_PATH=creds/token.pickle
 DRIVE_FOLDER_NAME=DRIVER_STATION_LOGS
 LOCAL_STORAGE_PATH=/mnt/storage/csvlogs
+FIREBASE_DB_BASE_URL=
+FIREBASE_CREDS_FILE=
 EOF
-  echo "[i] Created $MACHINE_DIR/.env (please edit with your values)"
+  echo "[i] Created $MACHINE_DIR/.env"
 else
   echo "[i] .env already present — leaving it in place"
+fi
+
+set_env_value() {
+  local key="$1"
+  local value="$2"
+  local temp_env
+
+  temp_env=$(mktemp "$MACHINE_DIR/.env.XXXXXX")
+  grep -v "^${key}=" "$MACHINE_DIR/.env" > "$temp_env" || true
+  printf '%s=%s\n' "$key" "$value" >> "$temp_env"
+  mv "$temp_env" "$MACHINE_DIR/.env"
+}
+
+if ! grep -q '^FIREBASE_DB_BASE_URL=.' "$MACHINE_DIR/.env"; then
+  read -r -p "Enter your Firebase Realtime Database URL: " FIREBASE_DB_BASE_URL
+  if [ -z "$FIREBASE_DB_BASE_URL" ]; then
+    echo "[!] A Firebase Realtime Database URL is required."
+    exit 1
+  fi
+  set_env_value "FIREBASE_DB_BASE_URL" "$FIREBASE_DB_BASE_URL"
+fi
+
+if ! grep -q '^FIREBASE_CREDS_FILE=.' "$MACHINE_DIR/.env"; then
+  read -r -p "Enter the absolute path to your Firebase service account JSON file: " FIREBASE_CREDS_FILE
+  if [ -z "$FIREBASE_CREDS_FILE" ] || [ ! -f "$FIREBASE_CREDS_FILE" ] || [[ "$FIREBASE_CREDS_FILE" != /* ]]; then
+    echo "[!] An existing absolute Firebase credential-file path is required."
+    exit 1
+  fi
+  set_env_value "FIREBASE_CREDS_FILE" "$FIREBASE_CREDS_FILE"
 fi
 
 echo "\n[i] Tailscale installation (optional network access)"
@@ -135,6 +166,46 @@ else
   echo "[i] $CHECK_TIMER already exists — skipping"
 fi
 
+echo "[i] Creating systemd service and timer to update from GitHub"
+GITHUB_UPDATE_SERVICE=/etc/systemd/system/offsite-github-update.service
+GITHUB_UPDATE_TIMER=/etc/systemd/system/offsite-github-update.timer
+
+if [ ! -f "$GITHUB_UPDATE_SERVICE" ]; then
+  sudo bash -c "cat > $GITHUB_UPDATE_SERVICE" <<EOF
+[Unit]
+Description=Update Offsite Compute checkout from GitHub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=$CURRENT_USER
+WorkingDirectory=$MACHINE_DIR
+ExecStart=/usr/bin/git -C $MACHINE_DIR pull --ff-only
+EOF
+  echo "[i] Created $GITHUB_UPDATE_SERVICE"
+else
+  echo "[i] $GITHUB_UPDATE_SERVICE already exists — skipping"
+fi
+
+if [ ! -f "$GITHUB_UPDATE_TIMER" ]; then
+  sudo bash -c "cat > $GITHUB_UPDATE_TIMER" <<EOF
+[Unit]
+Description=Check GitHub for Offsite Compute updates every 30 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  echo "[i] Created $GITHUB_UPDATE_TIMER"
+else
+  echo "[i] $GITHUB_UPDATE_TIMER already exists — skipping"
+fi
+
 echo "[i] Creating systemd service for the battery scoring engine (long-running)"
 SCORING_SERVICE_FILE=/etc/systemd/system/offsite-scoring-engine.service
 if [ ! -f "$SCORING_SERVICE_FILE" ]; then
@@ -163,9 +234,11 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now offsite-firebase-scraper.service || true
 sudo systemctl enable --now offsite-scoring-engine.service || true
 sudo systemctl enable --now offsite-check.timer || true
+sudo systemctl enable --now offsite-github-update.timer || true
 
 echo "[✓] Installation complete."
 echo "[i] Check service logs with: sudo journalctl -u offsite-firebase-scraper.service -f"
 echo "[i] Check timer status with: systemctl list-timers --all | grep offsite-check"
+echo "[i] Check GitHub update logs with: sudo journalctl -u offsite-github-update.service -f"
 
 echo "[i] If you did not provide a Tailscale auth key and want remote access, run: sudo tailscale up and follow the interactive flow."

@@ -95,15 +95,18 @@ GOOGLE_CREDS_PATH=/creds/credentials.json
 DRIVE_FOLDER_NAME="Folder name in google drive"
 LOCAL_STORAGE_PATH=Backup location
 TEST_DRIVE_FOLDER_ID=FOLDER_ID
+FIREBASE_DB_BASE_URL=https://your-project.firebaseio.com
+FIREBASE_CREDS_FILE=/absolute/path/to/your/firebase-service-account.json
 ```
 
 Notes:
 - `GOOGLE_CREDS_PATH` should point to the OAuth client credentials file you download (JSON) from the Google Cloud Console. Place it under a `creds/` subfolder or update the path.
 - On first run the script will open a browser to perform the OAuth flow and create `GOOGLE_TOKEN_PATH` (token.pickle). On a headless Pi, use an SSH port-forward or run the flow on a local machine and copy the token file.
+- `FIREBASE_DB_BASE_URL` and `FIREBASE_CREDS_FILE` are required by the Firebase scraper and battery scoring services. `FIREBASE_CREDS_FILE` must be an absolute path to the service-account JSON file.
 
 ## Installation (recommended)
 
-There is an installer script that handles the common setup tasks: creating a virtualenv, installing Python dependencies (from `requirements.txt`), creating a minimal `.env` template, optionally installing Tailscale, and creating systemd units to run the services automatically.
+There is an installer script that handles the common setup tasks: creating a virtualenv, installing Python dependencies (from `requirements.txt`), creating a `.env` template, collecting missing Firebase settings, optionally installing Tailscale, and creating systemd units to run the services automatically.
 
 Run the installer:
 
@@ -115,12 +118,13 @@ chmod +x install.sh
 
 What the installer does
 - Creates a virtualenv at `MachineC_OffsiteCompute/venv` and installs packages from `requirements.txt` (or falls back to a reasonable default set).
-- Creates a minimal `.env` template in the MachineC folder if you don't already have one; edit it with the paths and values for `GOOGLE_CREDS_PATH`, `GOOGLE_TOKEN_PATH`, `DRIVE_FOLDER_NAME`, and `LOCAL_STORAGE_PATH`.
+- Creates a `.env` template in the MachineC folder if you don't already have one and prompts for missing Firebase database and service-account settings. Set the paths and values for `GOOGLE_CREDS_PATH`, `GOOGLE_TOKEN_PATH`, `DRIVE_FOLDER_NAME`, and `LOCAL_STORAGE_PATH` before using the Drive processing service.
 - Optionally installs Tailscale and can bring it up with an auth key if you provide one during the installer prompt.
 - Creates and enables these systemd units:
 	- `offsite-firebase-scraper.service` — long-running service that runs `FirebaseScraper.py` continuously.
 	- `offsite-check.service` — a oneshot service that runs `check_and_run_main.py` (the wrapper that only runs `main.py` when new Drive files are detected).
 	- `offsite-check.timer` — a systemd timer that triggers `offsite-check.service` every 10 minutes and once shortly after boot.
+  - `offsite-github-update.service` and `offsite-github-update.timer` — checks GitHub five minutes after boot and every 30 minutes, applying only fast-forward updates. It leaves any checkout with local edits or commits unchanged and reports the conflict in the service logs.
 
 Manual alternative
 If you prefer not to run the installer, you can still set things up manually:
@@ -165,6 +169,7 @@ We provide an installer which creates systemd units for two purposes:
 
 - `offsite-firebase-scraper.service` — runs `FirebaseScraper.py` continuously as a service.
 - `offsite-check.service` + `offsite-check.timer` — the timer triggers every 10 minutes (and once shortly after boot) to run `check_and_run_main.py`. The wrapper checks Drive for new `.dslog`/`.dsevents` files and runs `main.py` only when new files are found (i.e. files not already listed in `exclusionListFP.txt`).
+- `offsite-github-update.service` + `offsite-github-update.timer` — the timer checks the repository five minutes after boot and every 30 minutes. The service runs `git pull --ff-only`, so it updates only clean checkouts and never creates an automatic merge.
 
 If you prefer a single long-running service for `main.py` instead of a timer, you can create your own systemd unit similar to the example below and enable it instead of the timer:
 
@@ -206,6 +211,9 @@ Service & timer troubleshooting
 	- `sudo journalctl -u offsite-check.service --since "1 hour ago"`
 - Timer status:
 	- `systemctl list-timers --all | grep offsite-check`
+- Check GitHub update logs or trigger an immediate check:
+  - `sudo journalctl -u offsite-github-update.service --since "1 hour ago"`
+  - `sudo systemctl start offsite-github-update.service`
 
 If you need to run the Drive-check manually (for testing):
 

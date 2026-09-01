@@ -2,7 +2,7 @@
 set -e
 
 CURRENT_USER=$(whoami)
-PROJECT_DIR=/home/$CURRENT_USER/Intellegent-Battery-Timer
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 echo "Please have your firebase credentials handy. You will be prompted to enter them."
 
@@ -19,17 +19,16 @@ pip3 install --break-system-packages -r requirements.txt
 echo "[*] Setting up project folder..."
 mkdir -p "$PROJECT_DIR"
 
-# Copy .env if it exists locally, but only if not already present in project dir
-if [ -f .env ] && [ ! -f "$PROJECT_DIR/.env" ]; then
-  cp .env "$PROJECT_DIR/"
-  echo "[*] Copied existing .env into $PROJECT_DIR"
-fi
-
 # Firebase credentials
-if [ ! -f "$PROJECT_DIR/.env" ]; then
+if [ ! -f "$PROJECT_DIR/.env" ] || ! grep -q '^FIREBASE_DB_BASE_URL=.' "$PROJECT_DIR/.env" || ! grep -q '^FIREBASE_CREDS_FILE=.' "$PROJECT_DIR/.env"; then
   echo "[*] Configuring Firebase..."
-  read -p "Enter your Firebase Realtime Database URL: " FIREBASE_DB_BASE_URL
-  read -p "Enter the full path to your Firebase service account JSON file: " FIREBASE_CREDS_FILE
+  read -r -p "Enter your Firebase Realtime Database URL: " FIREBASE_DB_BASE_URL
+  read -r -p "Enter the absolute path to your Firebase service account JSON file: " FIREBASE_CREDS_FILE
+
+  if [ -z "$FIREBASE_DB_BASE_URL" ] || [ -z "$FIREBASE_CREDS_FILE" ] || [ ! -f "$FIREBASE_CREDS_FILE" ] || [[ "$FIREBASE_CREDS_FILE" != /* ]]; then
+    echo "[!] A database URL and an existing absolute credential-file path are required."
+    exit 1
+  fi
 
   cat <<EOF > "$PROJECT_DIR/.env"
 FIREBASE_DB_BASE_URL=$FIREBASE_DB_BASE_URL
@@ -126,12 +125,13 @@ Description=TagTrackerFirebase
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/python3 $(pwd)/input_listener.py
+ExecStart=/usr/bin/python3 $PROJECT_DIR/input_listener.py
 Restart=always
 User=$(whoami)
 Environment=DISPLAY=:0
 Environment=XAUTHORITY=/home/$(whoami)/.Xauthority
-WorkingDirectory=$(pwd)
+WorkingDirectory=$PROJECT_DIR
+EnvironmentFile=$PROJECT_DIR/.env
 
 [Install]
 WantedBy=graphical.target

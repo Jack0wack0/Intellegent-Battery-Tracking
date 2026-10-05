@@ -1,5 +1,7 @@
 # Machine C: scoring and durable Drive ingestion
 
+See the [coordinated change summary and detailed installation guide](../Shared/INSTALL_COMPETITION_RELEASE.md) before installing this release.
+
 Python 3.10+ on Linux, with the pinned requirements installed into a virtualenv.
 The new installer replaces units deliberately, verifies required services start, and disables
 the legacy live-source auto-pull timer. Updates are explicit validated releases with rollback.

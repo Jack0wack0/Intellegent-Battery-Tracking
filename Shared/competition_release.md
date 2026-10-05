@@ -1,5 +1,7 @@
 # Competition release and acceptance
 
+For exact setup commands and the full change summary, use [INSTALL_COMPETITION_RELEASE.md](INSTALL_COMPETITION_RELEASE.md).
+
 This is a coordinated cart + two Arduino boards + offsite scorer/ingestion + kiosk release.
 The implementation branch fixes the audited software paths. Competition approval still requires
 the actual Linux installation, deployed Firebase/website configuration and physical acceptance below.

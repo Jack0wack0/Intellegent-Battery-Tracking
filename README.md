@@ -1,5 +1,8 @@
 # Intelligent Battery Tracking
 
+**Install this release:** [Changes and detailed installation guide](Shared/INSTALL_COMPETITION_RELEASE.md)
+(Pi, both Arduino boards, offsite services, website/rules, backups and verification).
+
 Competition hardening is on `fix/competition-readiness`, with the matching BatteryTrackingWebsite
 release. Read [Shared/competition_release.md](Shared/competition_release.md) for the coordinated
 migration, validated checks and required physical/deployed sign-off. The historical audit remains

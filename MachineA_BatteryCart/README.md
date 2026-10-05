@@ -1,5 +1,7 @@
 # Machine A: competition cart
 
+See the [coordinated change summary and detailed installation guide](../Shared/INSTALL_COMPETITION_RELEASE.md) before installing this release.
+
 Runs seven slots by default: Arduino 1 supplies slots 0–5, Arduino 2 supplies slot 6.
 The dedicated RFID scanners act as USB keyboards. Scans are read using Linux evdev and
 are grabbed exclusively, so they do not depend on terminal stdin or Chromium focus.

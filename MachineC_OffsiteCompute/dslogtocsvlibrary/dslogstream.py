@@ -30,7 +30,7 @@ class DsLogStream:
         while True:
             time = self.start_time + timedelta(seconds=self.entry_distance_s * index)
             index += 1
-            if data := self.conditional_read(LogEntry.length()):
+            if data := self.conditional_read(LogEntry.length(), allow_eof=True):
                 entry = LogEntry.from_bytes(data)
             else:
                 break
@@ -48,8 +48,10 @@ class DsLogStream:
                 entry.pdp_data = pdp_data
             yield entry
 
-    def conditional_read(self, expected_size: int) -> Optional[bytes]:
+    def conditional_read(self, expected_size: int, allow_eof=False) -> Optional[bytes]:
         data = self.file.read(expected_size)
-        if len(data) != expected_size:
+        if not data and allow_eof:
             return None
+        if len(data) != expected_size:
+            raise ValueError(f"Truncated DS record: expected {expected_size}, got {len(data)}")
         return data

@@ -1,162 +1,115 @@
-"""
-Write-Ahead Logging (WAL) module for MachineA Battery Cart.
-
-This module provides a LocalQueue that persists pending Firebase updates to disk
-before attempting to upload them. If the Pi loses internet connection, the queue
-is preserved and will retry on reconnection.
-"""
-
+"""Durable local state and ordered Firebase outbox; collection never needs cloud reads."""
 import json
-import os
-import time
 import logging
-from typing import Any, Callable, Optional
-from threading import Lock
+import os
+from pathlib import Path
+import sqlite3
+import threading
+import time
+import uuid
+from contextlib import contextmanager
+
 
 class LocalQueue:
-    """Thread-safe local queue for pending Firebase updates.
-    
-    All updates are written to disk before processing. If a write to Firebase
-    fails, the item remains in the queue for retry on next process() call.
-    """
+    def __init__(self, queue_file="cart.sqlite3", logger=None):
+        self.logger = logger or logging.getLogger("outbox")
+        self.lock = threading.RLock()
+        self.consumer = threading.Lock()
+        path = Path(queue_file)
+        legacy = path if path.suffix == ".json" else path.with_name("firebase_queue.json")
+        self.queue_file = str(path.with_suffix(".sqlite3") if path.suffix == ".json" else path)
+        self.connection = sqlite3.connect(self.queue_file, timeout=10, check_same_thread=False)
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute("PRAGMA synchronous=FULL")
+        if self.connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise sqlite3.DatabaseError("Local journal corrupt; restore backup, do not reset it")
+        self.connection.executescript("""
+            CREATE TABLE IF NOT EXISTS outbox (
+              seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT UNIQUE NOT NULL,
+              path TEXT NOT NULL, operation TEXT NOT NULL, payload TEXT NOT NULL,
+              created REAL NOT NULL, coalesce_key TEXT);
+            CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, payload TEXT NOT NULL);
+        """)
+        if legacy.exists() and not self.get_state("legacy_imported", False):
+            items = json.loads(legacy.read_text())
+            if not isinstance(items, list):
+                raise ValueError("Legacy outbox must be an array; source retained")
+            with self.transaction():
+                for item in items:
+                    self.enqueue(item["path"], item["data"], item.get("operation", "update"))
+                self.set_state("legacy_imported", True)
+        os.chmod(self.queue_file, 0o600)
 
-    def __init__(self, queue_file: str = "firebase_queue.json", logger: Optional[logging.Logger] = None):
-        """Initialize the LocalQueue.
-        
-        Args:
-            queue_file: Path to the persistent queue file (JSON).
-            logger: Optional logger for debug/info messages.
-        """
-        self.queue_file = queue_file
-        self.logger = logger or logging.getLogger("WAL")
-        self.lock = Lock()
-        self.queue = []
-        self._load_queue()
-
-    def _load_queue(self):
-        """Load queue from disk if it exists."""
-        if os.path.exists(self.queue_file):
-            try:
-                with open(self.queue_file, "r") as f:
-                    self.queue = json.load(f)
-                self.logger.info(f"Loaded {len(self.queue)} queued items from {self.queue_file}")
-            except Exception as e:
-                self.logger.error(f"Failed to load queue from {self.queue_file}: {e}")
-                self.queue = []
-        else:
-            self.queue = []
-
-    def _save_queue(self):
-        """Persist queue to disk."""
-        try:
-            with open(self.queue_file, "w") as f:
-                json.dump(self.queue, f, indent=2)
-        except Exception as e:
-            self.logger.error(f"Failed to save queue to {self.queue_file}: {e}")
-
-    def enqueue(self, path: str, data: Any, operation: str = "update"):
-        """Add an item to the queue and persist to disk.
-        
-        Args:
-            path: Firebase path (e.g., "BatteryList/BAT123").
-            data: Data to write (dict or other JSON-serializable).
-            operation: "update", "set", or "delete".
-        """
+    @contextmanager
+    def transaction(self):
         with self.lock:
-            item = {
-                "path": path,
-                "data": data,
-                "operation": operation,
-                "enqueued_at": time.time(),
-            }
-            self.queue.append(item)
-            self._save_queue()
-            self.logger.debug(f"[WAL] Enqueued {operation} to {path}")
+            nested = self.connection.in_transaction
+            if not nested:
+                self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield self
+                if not nested:
+                    self.connection.commit()
+            except BaseException:
+                if not nested:
+                    self.connection.rollback()
+                raise
 
-    def process(self, firebase_ref: Any, logger: Optional[logging.Logger] = None) -> int:
-        """Attempt to process all queued items.
-        
-        For each queued item, try to write it to Firebase. If successful,
-        remove it from the queue. If it fails, leave it in the queue for retry.
-        
-        Args:
-            firebase_ref: Firebase reference object (from firebase_admin.db.reference()).
-            logger: Optional logger for operation output.
-        
-        Returns:
-            Number of items successfully processed.
-        """
-        if logger is None:
-            logger = self.logger
-        
+    def enqueue(self, path, data, operation="update", *, event_id=None, coalesce_key=None):
+        if operation not in {"update", "set", "delete"}:
+            raise ValueError("Unsupported outbox operation")
+        if operation == "update" and not isinstance(data, dict):
+            raise ValueError("Firebase update requires a mapping")
+        encoded = json.dumps(data, allow_nan=False, separators=(",", ":"))
+        identity = event_id or uuid.uuid4().hex
+        with self.transaction():
+            if coalesce_key:
+                self.connection.execute("DELETE FROM outbox WHERE coalesce_key=?", (coalesce_key,))
+            self.connection.execute(
+                "INSERT OR IGNORE INTO outbox(event_id,path,operation,payload,created,coalesce_key) VALUES(?,?,?,?,?,?)",
+                (identity, path, operation, encoded, time.time(), coalesce_key))
+        return identity
+
+    def set_state(self, key, value):
+        with self.transaction():
+            self.connection.execute("INSERT OR REPLACE INTO state VALUES(?,?)",
+                                    (key, json.dumps(value, allow_nan=False)))
+
+    def get_state(self, key, default=None):
+        with self.lock:
+            row = self.connection.execute("SELECT payload FROM state WHERE key=?", (key,)).fetchone()
+            return json.loads(row[0]) if row else default
+
+    def process(self, firebase_ref, logger=None, limit=100):
         processed = 0
-        failed = 0
-        
-        with self.lock:
-            items_to_process = list(self.queue)
-        
-        if not items_to_process:
-            logger.debug("[WAL] Queue is empty; nothing to process.")
-            return 0
-        
-        logger.info(f"[WAL] Processing {len(items_to_process)} queued item(s)...")
-        
-        remaining = []
-        for item in items_to_process:
-            path = item.get("path")
-            data = item.get("data")
-            operation = item.get("operation", "update")
-            enqueued_at = item.get("enqueued_at")
-            
-            try:
-                if operation == "update":
-                    firebase_ref.child(path).update(data)
-                elif operation == "set":
-                    firebase_ref.child(path).set(data)
-                elif operation == "delete":
-                    firebase_ref.child(path).delete()
-                else:
-                    logger.warning(f"[WAL] Unknown operation '{operation}' for {path}; skipping.")
-                    continue
-                
-                age = time.time() - enqueued_at
-                logger.info(f"[WAL] ✓ {operation} to {path} (queued for {age:.1f}s)")
+        with self.consumer:
+            with self.lock:
+                rows = self.connection.execute(
+                    "SELECT seq,path,operation,payload FROM outbox ORDER BY seq LIMIT ?", (limit,)).fetchall()
+            for seq, path, operation, payload in rows:
+                try:
+                    target = firebase_ref.child(path) if path else firebase_ref
+                    if operation == "delete":
+                        target.delete()
+                    else:
+                        getattr(target, operation)(json.loads(payload))
+                except Exception:
+                    (logger or self.logger).warning("Outbox upload failed; retaining ordered events", exc_info=True)
+                    break
+                with self.transaction():
+                    self.connection.execute("DELETE FROM outbox WHERE seq=?", (seq,))
                 processed += 1
-            except Exception as e:
-                logger.warning(f"[WAL] ✗ {operation} to {path} failed: {e} (will retry)")
-                failed += 1
-                remaining.append(item)
-        
-        # Update queue with items that failed
-        with self.lock:
-            self.queue = remaining
-            self._save_queue()
-        
-        if processed > 0:
-            logger.info(f"[WAL] Successfully processed {processed} item(s); {len(remaining)} still queued.")
-        if remaining:
-            logger.warning(f"[WAL] {len(remaining)} item(s) remain in queue and will be retried.")
-        
         return processed
 
-    def size(self) -> int:
-        """Return the current queue size."""
+    def size(self):
         with self.lock:
-            return len(self.queue)
+            return self.connection.execute("SELECT count(*) FROM outbox").fetchone()[0]
 
-    def clear(self):
-        """Clear the queue and remove the queue file."""
+    def get_queue_contents(self):
         with self.lock:
-            self.queue = []
-            self._save_queue()
-        if os.path.exists(self.queue_file):
-            try:
-                os.remove(self.queue_file)
-                self.logger.info(f"Cleared queue file: {self.queue_file}")
-            except Exception as e:
-                self.logger.error(f"Failed to delete queue file: {e}")
+            return [{"path": p, "operation": o, "data": json.loads(d)} for p, o, d in
+                    self.connection.execute("SELECT path,operation,payload FROM outbox ORDER BY seq")]
 
-    def get_queue_contents(self) -> list:
-        """Return a copy of the current queue contents (for debugging)."""
+    def close(self):
         with self.lock:
-            return [dict(item) for item in self.queue]
+            self.connection.close()

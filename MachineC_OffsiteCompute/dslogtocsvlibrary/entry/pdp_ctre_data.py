@@ -42,8 +42,7 @@ class PdpCtreData(PdpData):
             data_index = index // 6
             data_offset = index % 6
             value = longs[data_index]
-            num = value << (data_offset * 10)
-            num = num >> 54
+            num = (value >> (54 - data_offset * 10)) & 0x3FF
             currents[index] = num / 8
 
         return cls(pdp_id, currents, resistance, voltage, temperature)

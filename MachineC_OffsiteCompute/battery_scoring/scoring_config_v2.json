@@ -1,0 +1,65 @@
+{
+  "version": 2,
+  "match_score": {
+    "weights": {
+      "voltage": 0.45,
+      "soc": 0.15,
+      "internal_resistance": 0.2,
+      "voltage_18a": 0.2
+    },
+    "voltage_range": {
+      "min": 11.6,
+      "max": 12.9
+    },
+    "soc_range": {
+      "min": 20,
+      "max": 100
+    },
+    "internal_resistance_range_milliohm": {
+      "good": 8,
+      "bad": 25
+    },
+    "voltage_18a_range": {
+      "min": 9.0,
+      "max": 12.5
+    },
+    "freshness_hours": {
+      "full_weight_within": 2,
+      "zero_weight_after": 72
+    }
+  },
+  "health_score": {
+    "weights": {
+      "internal_resistance_trend": 0.3,
+      "capacity_soh": 0.3,
+      "voltage_18a_trend": 0.2,
+      "age_and_cycles": 0.2
+    },
+    "baseline_sample_size": 3,
+    "recent_sample_size": 3,
+    "internal_resistance_change_range_pct": {
+      "good": 5,
+      "bad": 50
+    },
+    "voltage_18a_change_range_pct": {
+      "good": -3,
+      "bad": -25
+    },
+    "capacity_soh_range_pct": {
+      "good": 90,
+      "bad": 60
+    },
+    "age_days_range": {
+      "full_score": 0,
+      "zero_score": 1460
+    },
+    "cycles_range": {
+      "full_score": 0,
+      "zero_score": 600
+    },
+    "min_points_for_trend": 6,
+    "cba_full_weight_days": 180,
+    "cba_zero_weight_days": 540
+  },
+  "notes": "Version 2: independent median trend windows and CBA freshness. Operational defaults require team calibration; no exact lifespan prediction."
+}

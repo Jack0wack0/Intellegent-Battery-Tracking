@@ -1,3 +1,4 @@
-pyserial
-firebase-admin
-python-dotenv
+pyserial==3.5
+firebase-admin==7.7.0
+python-dotenv==1.2.4
+evdev==1.9.3; sys_platform == 'linux'

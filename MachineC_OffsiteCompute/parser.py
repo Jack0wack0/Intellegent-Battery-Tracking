@@ -1,30 +1,29 @@
-import dslogparser
+"""Binary DS events; retain provenance and never guess an ambiguous battery tag."""
 import csv
-import os
+import re
+from artifacts import atomic_output
+from dslogtocsvlibrary.dseventstream import DsEventStream
 
-def parse_dslog(filepath):
-    """Return a list of (time, voltage, current) tuples."""
-    parser = dslogparser.DSLogParser(filepath)
-    parser.read_records()
-    # Simplified example:
-    rows = []
-    for r in parser.records:
-        rows.append((r.time, r.voltage, r.current))
-    return rows
+TAG_PATTERN = re.compile(r'\b(?:Battery(?:\s*(?:ID|Tag))?|BAT)\s*[:=]\s*(\d{10})\b', re.IGNORECASE)
+
+
+def event_records(filepath):
+    with open(filepath, 'rb') as source:
+        for event in DsEventStream(source):
+            message = event.raw_message
+            tags = sorted(set(TAG_PATTERN.findall(message)))
+            yield {'timestamp': event.date.isoformat(), 'message': message,
+                   'battery_id': tags[0] if len(tags) == 1 else '',
+                   'binding_status': 'identified' if len(tags) == 1 else 'ambiguous' if tags else 'unmatched'}
+
 
 def parse_dsevents(filepath):
-    """Return battery ID string from .dsevents file (placeholder)."""
-    with open(filepath, 'r', errors='ignore') as f:
-        text = f.read()
-    # Very rough placeholder extraction:
-    for line in text.splitlines():
-        if "Battery" in line or "BAT" in line:
-            return line.strip()
-    return "Unknown"
+    tags = {row['battery_id'] for row in event_records(filepath) if row['battery_id']}
+    return next(iter(tags)) if len(tags) == 1 else None
 
-def write_csv(rows, out_path):
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    with open(out_path, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(["time", "voltage", "current"])
-        writer.writerows(rows)
+
+def convert_events(source, destination):
+    with atomic_output(destination, newline='') as output:
+        writer = csv.DictWriter(output, fieldnames=['timestamp', 'message', 'battery_id', 'binding_status'])
+        writer.writeheader()
+        writer.writerows(event_records(source))

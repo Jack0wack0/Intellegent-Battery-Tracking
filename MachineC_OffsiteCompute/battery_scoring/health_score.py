@@ -8,7 +8,7 @@ rather than being treated as a bad reading.
 """
 
 from datetime import datetime, timezone
-from statistics import mean
+from statistics import mean, median
 from typing import List, Optional
 
 from .models import Battery, CBATest, PullMeasurement, ScoreComponent, ScoreResult
@@ -16,10 +16,10 @@ from .score_utils import normalize_linear, weighted_average
 
 
 def _trend_change_pct(values: List[float], baseline_n: int, recent_n: int, min_points: int) -> Optional[float]:
-    if len(values) < min_points:
+    if len(values) < max(min_points, baseline_n + recent_n):
         return None
-    baseline = mean(values[:baseline_n]) if len(values) >= baseline_n else values[0]
-    recent = mean(values[-recent_n:]) if len(values) >= recent_n else values[-1]
+    baseline = median(values[:baseline_n])
+    recent = median(values[-recent_n:])
     if baseline == 0:
         return None
     return (recent - baseline) / baseline * 100.0
@@ -74,7 +74,9 @@ def compute_health_score(
         explanation.append("No CBA capacity test on record yet; Health Score confidence reduced.")
     else:
         cba_sorted = sorted(cba_tests, key=lambda t: t.timestamp or datetime.min.replace(tzinfo=timezone.utc))
-        baseline_capacity = cba_sorted[0].capacity_ah
+        baseline_id = battery.raw.get("baselineCBATestId")
+        baseline_test = next((t for t in cba_sorted if t.test_id == baseline_id), None) if baseline_id else cba_sorted[0]
+        baseline_capacity = baseline_test.capacity_ah if baseline_test else 0
         latest_capacity = cba_sorted[-1].capacity_ah
         soh_pct = (latest_capacity / baseline_capacity * 100.0) if baseline_capacity else None
         if soh_pct is None:
@@ -82,7 +84,15 @@ def compute_health_score(
         else:
             rng = cfg["capacity_soh_range_pct"]
             norm = normalize_linear(soh_pct, rng["bad"], rng["good"])
-            components.append(ScoreComponent("capacitySOHPct", soh_pct, norm, weights["capacity_soh"], 0.0))
+            last_at = cba_sorted[-1].timestamp
+            from .score_utils import freshness_weight
+            freshness = freshness_weight(last_at, now, cfg.get("cba_full_weight_days", 180) * 24,
+                                         cfg.get("cba_zero_weight_days", 540) * 24)
+            components.append(ScoreComponent("capacitySOHPct", soh_pct, norm, weights["capacity_soh"] * freshness, 0.0, freshness))
+            if len(cba_sorted) == 1:
+                explanation.append("First CBA establishes a baseline, not evidence of undegraded capacity.")
+            if freshness < 1:
+                explanation.append("Old CBA result reduces confidence; a fresh capacity test is recommended.")
             if norm < 50:
                 explanation.append(f"Measured capacity has fallen to {soh_pct:.0f}% of baseline.")
             last_test_at = cba_sorted[-1].timestamp

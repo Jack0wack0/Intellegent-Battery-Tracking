@@ -13,7 +13,7 @@ from .models import PullMeasurement, ScoreComponent, ScoreResult
 from .score_utils import freshness_weight, normalize_linear, weighted_average
 
 
-def compute_match_score(measurement: PullMeasurement, config: dict, now: Optional[datetime] = None) -> ScoreResult:
+def compute_match_score(measurement: PullMeasurement, config: dict, now: Optional[datetime] = None, history=None) -> ScoreResult:
     now = now or datetime.now(timezone.utc)
     cfg = config["match_score"]
     weights = cfg["weights"]
@@ -25,7 +25,9 @@ def compute_match_score(measurement: PullMeasurement, config: dict, now: Optiona
 
     # Voltage is required and always present on a valid PullMeasurement, so it is
     # always fresh relative to its own timestamp.
-    fresh = freshness_weight(measurement.timestamp, now, full_h, zero_h) if measurement.timestamp else 1.0
+    fresh = freshness_weight(measurement.timestamp, now, full_h, zero_h)
+    if fresh == 0:
+        explanation.append("No recent timestamped voltage: readiness is unknown; retest before selection.")
     v_norm = normalize_linear(measurement.current_voltage, cfg["voltage_range"]["min"], cfg["voltage_range"]["max"])
     components.append(ScoreComponent("currentVoltage", measurement.current_voltage, v_norm, weights["voltage"], 0.0, fresh))
 
@@ -37,13 +39,22 @@ def compute_match_score(measurement: PullMeasurement, config: dict, now: Optiona
         ("voltage18A", measurement.voltage_18a, cfg["voltage_18a_range"], False, "voltage_18a"),
     ]
 
+    attributes = {"socPercent": "soc_percent", "internalResistanceMilliOhm": "internal_resistance_milliohm", "voltage18A": "voltage_18a"}
     for field_name, raw_value, rng, invert, weight_key in optional_specs:
+        optional_fresh = fresh
+        if raw_value is None and history:
+            observation = next((m for m in reversed(history) if getattr(m, attributes[field_name]) is not None), None)
+            if observation:
+                raw_value = getattr(observation, attributes[field_name])
+                optional_fresh = freshness_weight(observation.timestamp, now, full_h, zero_h)
         if raw_value is None:
             components.append(ScoreComponent(field_name, None, None, weights[weight_key], 0.0, 0.0))
             explanation.append(f"{field_name} not provided; Match Score confidence reduced.")
             continue
         norm = normalize_linear(raw_value, rng["min"], rng["max"], invert=invert)
-        components.append(ScoreComponent(field_name, raw_value, norm, weights[weight_key], 0.0, fresh))
+        components.append(ScoreComponent(field_name, raw_value, norm, weights[weight_key], 0.0, optional_fresh))
+        if optional_fresh == 0:
+            explanation.append(f"{field_name} is stale; excluded from readiness.")
 
     # Weighted average over whatever is present; weight for missing/stale inputs is
     # effectively zero, which raises the relative contribution of what IS present

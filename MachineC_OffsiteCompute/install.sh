@@ -1,244 +1,102 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-CURRENT_USER=$(whoami)
-ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_NAME="Intellegent-Battery-Tracking"
-MACHINE_DIR="$ROOT_DIR"
-VENV_DIR="$MACHINE_DIR/venv"
-
-echo "[i] MachineC installer — setting up OffsiteCompute in: $MACHINE_DIR"
-
-echo "[i] Updating system packages..."
-sudo apt-get update -y
-sudo apt-get upgrade -y
-
-echo "[i] Installing prerequisites..."
-sudo apt-get install -y python3 python3-venv python3-pip curl git || true
-
-echo "[i] Creating Python virtualenv at $VENV_DIR (if missing)"
-if [ ! -d "$VENV_DIR" ]; then
-  python3 -m venv "$VENV_DIR"
-fi
-
-echo "[i] Activating venv and installing Python requirements..."
-# shellcheck disable=SC1090
-source "$VENV_DIR/bin/activate"
-if [ -f "$MACHINE_DIR/requirements.txt" ]; then
-  pip install --upgrade pip
-  pip install -r "$MACHINE_DIR/requirements.txt"
-else
-  pip install --upgrade pip
-  pip install google-api-python-client google-auth google-auth-oauthlib python-dotenv
-fi
-
-deactivate || true
-
-echo "[i] Ensuring credentials folder exists"
-mkdir -p "$MACHINE_DIR/creds"
-
-if [ ! -f "$MACHINE_DIR/.env" ]; then
-  echo "[i] No .env found in $MACHINE_DIR — creating a minimal template"
-  cat > "$MACHINE_DIR/.env" <<EOF
-# Example .env values (fill these in)
-GOOGLE_CREDS_PATH=creds/credentials.json
-GOOGLE_TOKEN_PATH=creds/token.pickle
-DRIVE_FOLDER_NAME=DRIVER_STATION_LOGS
-LOCAL_STORAGE_PATH=/mnt/storage/csvlogs
+TASK_ROOT=$(cd "$(dirname "$0")" && pwd)
+TASK_USER=$(id -un)
+[[ "$TASK_USER" != root ]] || { echo 'Run as the service user; sudo is used for system changes.'; exit 1; }
+cd "$TASK_ROOT"
+sudo apt-get update
+sudo apt-get install -y python3 python3-venv git
+python3 -c 'import sys; assert sys.version_info >= (3,10), "Python 3.10+ required"'
+python3 -m venv venv
+venv/bin/python -m pip install -r requirements.txt
+venv/bin/python -m pip check
+if [[ ! -f .env ]]; then
+  umask 077
+  cat > .env <<'EOF'
 FIREBASE_DB_BASE_URL=
 FIREBASE_CREDS_FILE=
+GOOGLE_CREDS_PATH=creds/credentials.json
+GOOGLE_TOKEN_PATH=creds/token.json
+DRIVE_FOLDER_ID=
+LOCAL_STORAGE_PATH=
 EOF
-  echo "[i] Created $MACHINE_DIR/.env"
-else
-  echo "[i] .env already present — leaving it in place"
+  echo 'Fill .env before rerunning; authorize Drive with venv/bin/python drive_sync.py --authorize.'
+  exit 1
 fi
-
-set_env_value() {
-  local key="$1"
-  local value="$2"
-  local temp_env
-
-  temp_env=$(mktemp "$MACHINE_DIR/.env.XXXXXX")
-  grep -v "^${key}=" "$MACHINE_DIR/.env" > "$temp_env" || true
-  printf '%s=%s\n' "$key" "$value" >> "$temp_env"
-  mv "$temp_env" "$MACHINE_DIR/.env"
-}
-
-if ! grep -q '^FIREBASE_DB_BASE_URL=.' "$MACHINE_DIR/.env"; then
-  read -r -p "Enter your Firebase Realtime Database URL: " FIREBASE_DB_BASE_URL
-  if [ -z "$FIREBASE_DB_BASE_URL" ]; then
-    echo "[!] A Firebase Realtime Database URL is required."
-    exit 1
-  fi
-  set_env_value "FIREBASE_DB_BASE_URL" "$FIREBASE_DB_BASE_URL"
-fi
-
-if ! grep -q '^FIREBASE_CREDS_FILE=.' "$MACHINE_DIR/.env"; then
-  read -r -p "Enter the absolute path to your Firebase service account JSON file: " FIREBASE_CREDS_FILE
-  if [ -z "$FIREBASE_CREDS_FILE" ] || [ ! -f "$FIREBASE_CREDS_FILE" ] || [[ "$FIREBASE_CREDS_FILE" != /* ]]; then
-    echo "[!] An existing absolute Firebase credential-file path is required."
-    exit 1
-  fi
-  set_env_value "FIREBASE_CREDS_FILE" "$FIREBASE_CREDS_FILE"
-fi
-
-echo "\n[i] Tailscale installation (optional network access)"
-read -p "Install Tailscale now? [y/N]: " install_tailscale
-if [[ "$install_tailscale" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-  echo "[i] Installing Tailscale..."
-  # official quick-install script
-  curl -fsSL https://tailscale.com/install.sh | sudo sh
-
-  read -p "If you have a Tailscale auth key and want to automatically connect (optional), paste it now (or press Enter to skip): " TS_AUTHKEY
-  if [ -n "$TS_AUTHKEY" ]; then
-    echo "[i] Bringing up Tailscale with provided auth key..."
-    sudo tailscale up --authkey "$TS_AUTHKEY" || true
-  else
-    echo "[i] Tailscale installed. Run 'sudo tailscale up' as needed to authenticate this node."
-  fi
-else
-  echo "[i] Skipping Tailscale installation. You can install it later with: curl -fsSL https://tailscale.com/install.sh | sudo sh"
-fi
-
-echo "\n[i] Creating systemd service for FirebaseScraper (long-running)"
-SERVICE_FILE=/etc/systemd/system/offsite-firebase-scraper.service
-if [ ! -f "$SERVICE_FILE" ]; then
-  sudo bash -c "cat > $SERVICE_FILE" <<EOF
+venv/bin/python - <<'PY'
+from dotenv import dotenv_values
+from pathlib import Path
+c=dotenv_values('.env')
+for k in ('FIREBASE_DB_BASE_URL','FIREBASE_CREDS_FILE','GOOGLE_CREDS_PATH','GOOGLE_TOKEN_PATH','LOCAL_STORAGE_PATH'):
+    if not c.get(k): raise SystemExit(f'Missing {k}')
+if not c.get('DRIVE_FOLDER_ID') and not c.get('DRIVE_FOLDER_NAME'): raise SystemExit('Configure DRIVE_FOLDER_ID')
+for k in ('FIREBASE_CREDS_FILE','GOOGLE_CREDS_PATH','GOOGLE_TOKEN_PATH'):
+    if not Path(c[k]).is_file(): raise SystemExit(f'{k} missing; authorize Drive first')
+if c['GOOGLE_TOKEN_PATH'].endswith('.pickle'): raise SystemExit('Reauthorize to token.json; pickle is unsupported')
+if not Path(c['LOCAL_STORAGE_PATH']).is_dir(): raise SystemExit('Persistent storage must be mounted/created before install')
+PY
+chmod 600 .env
+mkdir -p state
+TASK_UNITS=$(mktemp -d)
+trap 'rm -rf "$TASK_UNITS"' EXIT
+write_service() {
+  local service_name=$1 module=$2
+  cat > "$TASK_UNITS/$service_name.service" <<EOF
 [Unit]
-Description=Offsite Firebase Scraper
-After=network.target
-
-[Service]
-User=$CURRENT_USER
-WorkingDirectory=$MACHINE_DIR
-ExecStart=$VENV_DIR/bin/python3 $MACHINE_DIR/FirebaseScraper.py
-Restart=on-failure
-EnvironmentFile=$MACHINE_DIR/.env
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  echo "[i] Created $SERVICE_FILE"
-else
-  echo "[i] $SERVICE_FILE already exists — skipping creation"
-fi
-
-echo "[i] Creating systemd service and timer to check Drive and run main.py only when new files exist"
-CHECK_SERVICE=/etc/systemd/system/offsite-check.service
-CHECK_TIMER=/etc/systemd/system/offsite-check.timer
-
-if [ ! -f "$CHECK_SERVICE" ]; then
-  sudo bash -c "cat > $CHECK_SERVICE" <<EOF
-[Unit]
-Description=Offsite Compute - check Drive and run main.py if new files exist
+Description=$service_name
 After=network-online.target
+Wants=network-online.target
 
 [Service]
-Type=oneshot
-User=$CURRENT_USER
-WorkingDirectory=$MACHINE_DIR
-ExecStart=$VENV_DIR/bin/python3 $MACHINE_DIR/check_and_run_main.py
-EnvironmentFile=$MACHINE_DIR/.env
+User=$TASK_USER
+WorkingDirectory="$TASK_ROOT"
+ExecStart="$TASK_ROOT/venv/bin/python3" $module
+EnvironmentFile="$TASK_ROOT/.env"
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  echo "[i] Created $CHECK_SERVICE"
-else
-  echo "[i] $CHECK_SERVICE already exists — skipping"
-fi
-
-if [ ! -f "$CHECK_TIMER" ]; then
-  sudo bash -c "cat > $CHECK_TIMER" <<EOF
+}
+write_service offsite-scoring-engine '-m battery_scoring.engine'
+write_service offsite-firebase-scraper "\"$TASK_ROOT/FirebaseScraper.py\""
+cat > "$TASK_UNITS/offsite-check.service" <<EOF
 [Unit]
-Description=Run offsite-check.service every 10 minutes
-
-[Timer]
-OnBootSec=1min
-OnUnitActiveSec=10min
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-  echo "[i] Created $CHECK_TIMER"
-else
-  echo "[i] $CHECK_TIMER already exists — skipping"
-fi
-
-echo "[i] Creating systemd service and timer to update from GitHub"
-GITHUB_UPDATE_SERVICE=/etc/systemd/system/offsite-github-update.service
-GITHUB_UPDATE_TIMER=/etc/systemd/system/offsite-github-update.timer
-
-if [ ! -f "$GITHUB_UPDATE_SERVICE" ]; then
-  sudo bash -c "cat > $GITHUB_UPDATE_SERVICE" <<EOF
-[Unit]
-Description=Update Offsite Compute checkout from GitHub
+Description=One durable Drive ingestion pass
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=$CURRENT_USER
-WorkingDirectory=$MACHINE_DIR
-ExecStart=/usr/bin/git -C $MACHINE_DIR pull --ff-only
+User=$TASK_USER
+WorkingDirectory="$TASK_ROOT"
+ExecStart="$TASK_ROOT/venv/bin/python3" "$TASK_ROOT/check_and_run_main.py"
+EnvironmentFile="$TASK_ROOT/.env"
+TimeoutStartSec=30min
+UMask=0077
+NoNewPrivileges=true
 EOF
-  echo "[i] Created $GITHUB_UPDATE_SERVICE"
-else
-  echo "[i] $GITHUB_UPDATE_SERVICE already exists — skipping"
-fi
-
-if [ ! -f "$GITHUB_UPDATE_TIMER" ]; then
-  sudo bash -c "cat > $GITHUB_UPDATE_TIMER" <<EOF
+cat > "$TASK_UNITS/offsite-check.timer" <<'EOF'
 [Unit]
-Description=Check GitHub for Offsite Compute updates every 30 minutes
-
+Description=Run Drive ingestion ten minutes after completion
 [Timer]
-OnBootSec=5min
-OnUnitActiveSec=30min
+OnBootSec=1min
+OnUnitInactiveSec=10min
 Persistent=true
-
 [Install]
 WantedBy=timers.target
 EOF
-  echo "[i] Created $GITHUB_UPDATE_TIMER"
-else
-  echo "[i] $GITHUB_UPDATE_TIMER already exists — skipping"
-fi
-
-echo "[i] Creating systemd service for the battery scoring engine (long-running)"
-SCORING_SERVICE_FILE=/etc/systemd/system/offsite-scoring-engine.service
-if [ ! -f "$SCORING_SERVICE_FILE" ]; then
-  sudo bash -c "cat > $SCORING_SERVICE_FILE" <<EOF
-[Unit]
-Description=Offsite Battery Health & Match Scoring Engine
-After=network.target
-
-[Service]
-User=$CURRENT_USER
-WorkingDirectory=$MACHINE_DIR
-ExecStart=$VENV_DIR/bin/python3 -m battery_scoring.engine
-Restart=on-failure
-EnvironmentFile=$MACHINE_DIR/.env
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  echo "[i] Created $SCORING_SERVICE_FILE"
-else
-  echo "[i] $SCORING_SERVICE_FILE already exists — skipping creation"
-fi
-
-echo "[i] Reloading systemd daemon and enabling services/timers"
+# Retire the unsafe live-source auto-pull timer; updates are explicit validated releases.
+sudo systemctl disable --now offsite-github-update.timer 2>/dev/null || true
+for unit in "$TASK_UNITS"/*; do sudo install -m 0644 "$unit" /etc/systemd/system/; done
 sudo systemctl daemon-reload
-sudo systemctl enable --now offsite-firebase-scraper.service || true
-sudo systemctl enable --now offsite-scoring-engine.service || true
-sudo systemctl enable --now offsite-check.timer || true
-sudo systemctl enable --now offsite-github-update.timer || true
-
-echo "[✓] Installation complete."
-echo "[i] Check service logs with: sudo journalctl -u offsite-firebase-scraper.service -f"
-echo "[i] Check timer status with: systemctl list-timers --all | grep offsite-check"
-echo "[i] Check GitHub update logs with: sudo journalctl -u offsite-github-update.service -f"
-
-echo "[i] If you did not provide a Tailscale auth key and want remote access, run: sudo tailscale up and follow the interactive flow."
+sudo systemctl enable --now offsite-scoring-engine.service offsite-firebase-scraper.service offsite-check.timer
+sudo systemctl restart offsite-scoring-engine.service offsite-firebase-scraper.service
+sleep 2
+for service in offsite-scoring-engine.service offsite-firebase-scraper.service offsite-check.timer; do
+  sudo systemctl is-active --quiet "$service"
+done
+printf 'Required services started. Verify health and first ingestion before release acceptance.\n'

@@ -1,68 +1,54 @@
-# Arduino Code
+# Arduino firmware: protocol v2
 
-This folder contains the Arduino sketches used on the two Arduino UNOs that monitor charging slots and drive an addressable LED strip.
+The cart has seven installed slots: A0–A5 on board 1 are slots 0–5; A0 on board 2 is slot 6.
+The remaining inputs on board 2 are ignored by the default Pi configuration. Ground unused
+inputs, use a shared ground and the LED strip's appropriate external power supply.
+Presence threshold hysteresis is 430/470 with a non-blocking 500 ms settle period.
 
-Files
-- `RFID_ARDUINO_1.ino` — Main Arduino controlling the LED strip (uses FastLED) and reporting slot state for slots 0–5.
-- `RFID_ARDUINO_2.ino` — Second Arduino that reports slot state for slots 6–11 (it adds +6 to its slot indices).
+The shared header owns both sketches. **Do not compile both `.ino` files in one Arduino IDE
+folder**, because they define two board configurations. Prepare separate sketch directories:
 
-Quick overview
-- Each Arduino reads analog sensors (A0..A5) to determine whether a battery is present in a slot.
-- When a slot state changes the Arduino prints a line to Serial (USB) in the form:
-	- `SLOT_<N>:PRESENT` or `SLOT_<N>:REMOVED`
-	- Example: `SLOT_3:PRESENT`
-- The Raspberry Pi `input_listener.py` listens to those serial messages and matches them with RFID scans.
+```sh
+python3 prepare_sketches.py /tmp/battery-cart-sketches
+```
 
-Dependencies
-- `RFID_ARDUINO_1.ino` requires the FastLED library. Install it in the Arduino IDE via Library Manager or with PlatformIO.
+Open `BatteryCartBoard1/BatteryCartBoard1.ino` or `BatteryCartBoard2/BatteryCartBoard2.ino`.
+Install FastLED **3.6.0** and select Arduino UNO. Verify the physical board assignment before
+uploading. The default seven-segment buffer controls pixels 0–59; active segments use
+positions 3, 11, 18, 26, 34, 42, 49 with width 5. Unused pixels beyond 59 are not driven by
+this firmware; power-cycle the strip during the coordinated firmware installation.
 
-Wiring notes
-- Connect the LED strip data line to the Arduino pin defined by `LED_PIN` (default `3` in `RFID_ARDUINO_1.ino`).
-- Power the LED strip with an appropriate external 5V supply and common ground between the Arduino and the strip.
-- Connect the analog presence sensors to A0..A5 on each Arduino.
-- USB connection to the Raspberry Pi is used for serial communication and power.
-- VERY IMPORTANT WIRING NOTE: Any unused slots MUST be grounded. Everything needs to share the same ground plane or false positives will occur.
+The tested seven-slot UNO build uses 8,638 bytes flash and 847 bytes SRAM on board 1,
+and 3,012 bytes flash/452 bytes SRAM on board 2 (native AVR GCC 15.2, AVR core 1.8.8,
+FastLED 3.6.0; see release evidence for final post-edit numbers).
 
-Key configuration values (in the sketches)
-- `threshold` (default `450`) — analog threshold to decide PRESENT vs REMOVED. Tune this for your sensors.
-- `slotCount` (default `6`) — number of slots each Arduino monitors. Do not change this
-- `NUM_SEGMENTS`, `SEGMENT_WIDTH` and `NUM_LEDS` in `RFID_ARDUINO_1.ino` define how the LED strip is partitioned into segments; the Python `input_listener.py` uses segment indices and positions to address LEDs.
+## Protocol
 
-Serial protocol / LED control
-- The main Arduino (1) accepts simple text commands over Serial to control LEDs. The format is:
-	- `SEG <id 0-6> POS <index> COLOR <hue 0-255> MODE SOLID|FLASH|PULSE|DEEPPULSE`\
-		Example: `SEG 3 POS 120 COLOR 90 MODE PULSE`
-- After processing a valid `SEG` command the Arduino responds with `ACK` and a human-readable summary.
-- A simple keep-alive command is supported: send `PING`, Arduino replies `PONG` and marks the serial connection active.
+At startup and after `SNAPSHOT`, a board emits:
 
-Important implementation details
-- `RFID_ARDUINO_1.ino` contains a `delay(500)` after detecting a state change — this debounce/delay is required because the Pi reads the arduino output faster than the Pi can recieve the RFID ID; do not remove it.
-- `RFID_ARDUINO_2.ino` reports slots with `i + 6` so the second board occupies slots 6..11.
+```text
+BEGIN 1 V2
+LAYOUT 7 60
+SLOT_0:PRESENT
+... all six board slots ...
+END 1
+```
 
-# Upload instructions
+Only board 1 emits LAYOUT. Board 2 uses BEGIN/END 2 and slots 6–11. The Pi waits for a
+complete snapshot and validates board ownership instead of treating silence as empty.
+`PING` returns `PONG <six-bit-presence-mask>`; the Pi uses it to repair dropped transitions. Board 1 accepts:
 
-Arduino IDE
-1. Open the `.ino` file in the Arduino IDE.
-2. Install the FastLED library (Sketch → Include Library → Manage Libraries → search `FastLED`).
-3. Select the correct board (`Arduino UNO`) and serial port.
-4. Upload.
+```text
+CMD abcdef123456 SEG 0 POS 3 COLOR 85 MODE DEEPPULSE
+ACK abcdef123456
+```
 
-PlatformIO (VS Code) Dont do this just use the Arduino IDE stop making life hard for yourself.
-1. Create or open a PlatformIO project for `uno` and add `FastLED` as a lib dependency.
-2. Copy the sketch code into `src/main.cpp` (you may need to adapt Arduino-style `.ino` top-level declarations to C++ style — usually just pasting works).
-3. Build and upload using PlatformIO.
+Commands must be complete, bounded and valid before ACK; modes are SOLID/FLASH/PULSE/DEEPPULSE.
+A five-second heartbeat timeout returns LEDs to purple fallback; each segment also expires ten seconds after its last valid command, so PING alone cannot preserve a stale pick. USB reconnect resets command caches
+and re-establishes snapshots. For a future larger cart, compile matching `CART_SLOT_COUNT`
+and update `SLOT_COUNT` and the physical LED mapping deliberately; do not change slot counts
+on only one machine.
 
-Tuning and testing
-- Adjust `threshold` values if you see false triggers.
-- Use the Arduino Serial Monitor (9600 baud) to watch `SLOT_` messages while plugging/unplugging batteries to confirm correct behavior.
-- For LEDs, verify the `SEG` command from the Raspberry Pi by running the Python LED manager; you should see `ACK` responses from `RFID_ARDUINO_1`.
-
-Troubleshooting
-- No serial output: confirm the Arduino is powered and the USB cable is data-capable.
-- LEDs not responding: check external power to the strip, common ground, and that `LED_PIN` and `NUM_LEDS` match your hardware.
-- Wrong slot indices: remember the second Arduino offsets its slot index by +6.
-
-Notes and suggestions
-- If you change the number of slots or LED layout, update both the Arduino sketch and `MachineA_BatteryCart/input_listener.py` so the segment positions and slot mapping remain in sync.
-
-
+Physical shielding/reader-field cross-talk is still a bench acceptance requirement. Firmware
+compilation and conservative software matching do not prove that neighboring tags are read
+reliably by the installed RF hardware.

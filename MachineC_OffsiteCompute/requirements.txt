@@ -1,12 +1,7 @@
-google-api-python-client
-google-auth
-google-auth-oauthlib
-google-auth-httplib2
-python-dotenv
-firebase-admin
-pytz
-dslogparser
-
-# Notes:
-# - `dslogtocsvlibrary` is included in this repository (local), so it is not required from PyPI.
-# - If you want pinned versions, replace the package names above with specific versions (e.g. pkg==1.2.3).
+google-api-python-client==2.201.0
+google-auth==2.60.0
+google-auth-oauthlib==1.5.0
+google-auth-httplib2==0.4.4
+python-dotenv==1.2.4
+firebase-admin==7.7.0
+pytz==2026.5

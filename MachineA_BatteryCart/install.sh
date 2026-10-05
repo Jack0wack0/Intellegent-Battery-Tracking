@@ -1,174 +1,84 @@
-#!/bin/bash
-set -e
-
-CURRENT_USER=$(whoami)
-PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
-
-echo "Please have your firebase credentials handy. You will be prompted to enter them."
-
-echo "[*] Updating system..."
-sudo apt-get update -y
-sudo apt-get upgrade -y
-
-echo "[*] Installing dependencies..."
-#sudo apt-get install -y python3 python3-pip chromium-browser #doesnt exist anymore?
-
-echo "[*] Installing Python requirements..."
-pip3 install --break-system-packages -r requirements.txt
-
-echo "[*] Setting up project folder..."
-mkdir -p "$PROJECT_DIR"
-
-# Firebase credentials
-if [ ! -f "$PROJECT_DIR/.env" ] || ! grep -q '^FIREBASE_DB_BASE_URL=.' "$PROJECT_DIR/.env" || ! grep -q '^FIREBASE_CREDS_FILE=.' "$PROJECT_DIR/.env"; then
-  echo "[*] Configuring Firebase..."
-  read -r -p "Enter your Firebase Realtime Database URL: " FIREBASE_DB_BASE_URL
-  read -r -p "Enter the absolute path to your Firebase service account JSON file: " FIREBASE_CREDS_FILE
-
-  if [ -z "$FIREBASE_DB_BASE_URL" ] || [ -z "$FIREBASE_CREDS_FILE" ] || [ ! -f "$FIREBASE_CREDS_FILE" ] || [[ "$FIREBASE_CREDS_FILE" != /* ]]; then
-    echo "[!] A database URL and an existing absolute credential-file path are required."
-    exit 1
-  fi
-
-  cat <<EOF > "$PROJECT_DIR/.env"
-FIREBASE_DB_BASE_URL=$FIREBASE_DB_BASE_URL
-FIREBASE_CREDS_FILE=$FIREBASE_CREDS_FILE
-EOF
-
-  echo "[*] Saved credentials to $PROJECT_DIR/.env"
-else
-  echo "[*] Skipping Firebase setup — $PROJECT_DIR/.env already exists."
+#!/usr/bin/env bash
+set -euo pipefail
+TASK_ROOT=$(cd "$(dirname "$0")" && pwd)
+TASK_USER=$(id -un)
+[[ "$TASK_USER" != root ]] || { echo 'Run as the service user; sudo is used for system changes.'; exit 1; }
+cd "$TASK_ROOT"
+sudo apt-get update
+sudo apt-get install -y python3 python3-venv python3-dev gcc libevdev-dev
+python3 -c 'import sys; assert sys.version_info >= (3,10), "Python 3.10+ is required"'
+python3 -m venv venv
+venv/bin/python -m pip install -r requirements.txt
+venv/bin/python -m pip check
+if [[ ! -f .env ]]; then
+  read -r -p 'Firebase database URL: ' TASK_URL
+  read -r -p 'Absolute service account JSON path: ' TASK_CREDS
+  read -r -p 'Dedicated RFID /dev/input/by-id/*event-kbd paths (comma separated; scanners only): ' TASK_RFID
+  [[ -n "$TASK_URL" && "$TASK_CREDS" == /* && -f "$TASK_CREDS" && -n "$TASK_RFID" ]] || exit 1
+  umask 077
+  printf 'FIREBASE_DB_BASE_URL=%s\nFIREBASE_CREDS_FILE=%s\nRFID_DEVICES=%s\nSLOT_COUNT=7\n' "$TASK_URL" "$TASK_CREDS" "$TASK_RFID" > .env
 fi
-
-# Detect connected Arduino serial devices
-# Detect connected Arduino serial devices
-HARDWARE_FILE="$PROJECT_DIR/hardwareIDS.json"
-
-if [ ! -f "$HARDWARE_FILE" ]; then
-  echo
-  echo "[*] Hardware ID setup starting..."
-
-  # Step 1: Detect first Arduino
-  echo
-  echo "Please plug in ONLY the FIRST Arduino (COM_PORT1), then type 'yes' and press Enter when ready."
-  read -r CONTINUE
-  if [ "$CONTINUE" != "yes" ]; then
-    echo "Aborting hardware ID detection."
-    exit 1
-  fi
-
-  SERIAL_BEFORE=($(ls /dev/serial/by-id/* 2>/dev/null || true))
-  echo "[*] Current connected serial devices:"
-  printf ' - %s\n' "${SERIAL_BEFORE[@]}"
-  echo
-  echo "Now unplug all Arduinos, press Enter when ready."
-  read -r
-
-  SERIAL_NONE=($(ls /dev/serial/by-id/* 2>/dev/null || true))
-  echo
-  echo "[*] Now plug in the FIRST Arduino again, then type 'yes' to detect it."
-  read -r CONFIRM1
-  if [ "$CONFIRM1" != "yes" ]; then
-    echo "Aborting hardware ID detection."
-    exit 1
-  fi
-
-  SERIAL_AFTER1=($(ls /dev/serial/by-id/* 2>/dev/null || true))
-  NEW1=$(comm -13 <(printf "%s\n" "${SERIAL_NONE[@]}" | sort) <(printf "%s\n" "${SERIAL_AFTER1[@]}" | sort))
-  if [ -z "$NEW1" ]; then
-    echo "[!] Could not detect new serial device for Arduino 1."
-    exit 1
-  fi
-  PORT1="$NEW1"
-  echo "COM_PORT1 set to $PORT1"
-
-  # Step 2: Detect second Arduino
-  echo
-  echo "Now unplug the FIRST Arduino, then plug in ONLY the SECOND Arduino (COM_PORT2)."
-  echo "Type 'yes' and press Enter when ready."
-  read -r CONFIRM2
-  if [ "$CONFIRM2" != "yes" ]; then
-    echo "Aborting hardware ID detection."
-    exit 1
-  fi
-
-  SERIAL_AFTER2=($(ls /dev/serial/by-id/* 2>/dev/null || true))
-  NEW2=$(comm -13 <(printf "%s\n" "${SERIAL_NONE[@]}" | sort) <(printf "%s\n" "${SERIAL_AFTER2[@]}" | sort))
-  if [ -z "$NEW2" ]; then
-    echo "[!] Could not detect new serial device for Arduino 2."
-    exit 1
-  fi
-  PORT2="$NEW2"
-  echo "COM_PORT2 set to $PORT2"
-
-  # Save both detected ports
-  cat <<EOF > "$HARDWARE_FILE"
-{
-  "COM_PORT1": "$PORT1",
-  "COM_PORT2": "$PORT2"
-}
-EOF
-
-  echo "[*] Saved hardware IDs to $HARDWARE_FILE"
-else
-  echo "[*] Skipping hardware ID setup — $HARDWARE_FILE already exists."
+if [[ ! -f hardwareIDS.json ]]; then
+  read -r -p 'Board 1 stable /dev/serial/by-id path: ' TASK_PORT1
+  read -r -p 'Board 2 stable /dev/serial/by-id path: ' TASK_PORT2
+  venv/bin/python - "$TASK_PORT1" "$TASK_PORT2" <<'PY'
+from pathlib import Path
+import json, sys
+ports={'COM_PORT1':sys.argv[1], 'COM_PORT2':sys.argv[2]}
+if ports['COM_PORT1']==ports['COM_PORT2'] or not all(p.startswith('/dev/serial/by-id/') and Path(p).exists() for p in ports.values()):
+    raise SystemExit('Two distinct connected stable serial paths are required')
+Path('hardwareIDS.json').write_text(json.dumps(ports,indent=2)+'\n')
+PY
 fi
-
-
-# Setup systemd service
-SERVICE_FILE=/etc/systemd/system/tagtracker.service
-if [ ! -f "$SERVICE_FILE" ]; then
-  echo "[*] Installing systemd service..."
-  sudo bash -c "cat > $SERVICE_FILE" <<EOF
+venv/bin/python - <<'PY'
+from dotenv import dotenv_values
+from pathlib import Path
+import glob, json
+c=dotenv_values('.env')
+for key in ('FIREBASE_DB_BASE_URL','FIREBASE_CREDS_FILE','RFID_DEVICES'):
+    if not c.get(key): raise SystemExit(f'Missing {key} in .env')
+if not Path(c['FIREBASE_CREDS_FILE']).is_file(): raise SystemExit('Credential file missing')
+for pattern in c['RFID_DEVICES'].split(','):
+    if not pattern.strip().startswith('/dev/input/by-id/') or not glob.glob(pattern.strip()):
+        raise SystemExit('Each RFID path must match a connected dedicated input device')
+ports=json.loads(Path('hardwareIDS.json').read_text())
+if ports['COM_PORT1']==ports['COM_PORT2'] or not all(Path(p).exists() for p in ports.values()):
+    raise SystemExit('Two distinct connected serial ports are required')
+PY
+# evdev access is required to the explicitly configured scanner paths; do not configure a general keyboard.
+sudo usermod -a -G dialout,input "$TASK_USER"
+mkdir -p state
+if [[ -f firebase_queue.json && ! -f state/firebase_queue.json ]]; then cp firebase_queue.json state/firebase_queue.json; fi
+chmod 600 .env
+TASK_UNIT=$(mktemp)
+trap 'rm -f "$TASK_UNIT"' EXIT
+cat > "$TASK_UNIT" <<EOF
 [Unit]
-Description=TagTrackerFirebase
-After=network.target
+Description=Durable battery cart collection
+After=local-fs.target
 
 [Service]
-ExecStart=/usr/bin/python3 $PROJECT_DIR/input_listener.py
-Restart=always
-User=$(whoami)
-Environment=DISPLAY=:0
-Environment=XAUTHORITY=/home/$(whoami)/.Xauthority
-WorkingDirectory=$PROJECT_DIR
-EnvironmentFile=$PROJECT_DIR/.env
+Type=simple
+User=$TASK_USER
+SupplementaryGroups=dialout input
+WorkingDirectory="$TASK_ROOT"
+ExecStart="$TASK_ROOT/venv/bin/python3" "$TASK_ROOT/input_listener.py"
+EnvironmentFile="$TASK_ROOT/.env"
+Environment="STATE_DIRECTORY=$TASK_ROOT/state"
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
 
 [Install]
-WantedBy=graphical.target
+WantedBy=multi-user.target
 EOF
-else
-  echo "[*] Skipping systemd service creation — $SERVICE_FILE already exists."
-fi
-
-# Open a web browser on boot
-BROWSER_SERVICE=/etc/systemd/system/browser.service
-if [ ! -f "$BROWSER_SERVICE" ]; then
-  echo "[*] Setting up browser boot..."
-  read -p "Enter the website you want to open on boot (do not include https://): " BOOTWEBSITE
-  cat <<EOF | sudo tee "$BROWSER_SERVICE" > /dev/null
-[Unit]
-Description=Open Chromium at $BOOTWEBSITE
-After=graphical.target
-
-[Service]
-ExecStart=chromium-browser --noerrdialogs --disable-infobars --kiosk https://$BOOTWEBSITE
-Restart=always
-User=$CURRENT_USER
-Environment=DISPLAY=:0
-Environment=XAUTHORITY=/home/$CURRENT_USER/.Xauthority
-
-[Install]
-WantedBy=graphical.target
-EOF
-else
-  echo "[*] Skipping browser service creation — $BROWSER_SERVICE already exists."
-fi
-
-# Enable and start services
+sudo install -m 0644 "$TASK_UNIT" /etc/systemd/system/tagtracker.service
 sudo systemctl daemon-reload
-sudo systemctl enable tagtracker.service
-sudo systemctl enable browser.service
+sudo systemctl enable --now tagtracker.service
 sudo systemctl restart tagtracker.service
-sudo systemctl restart browser.service
-
-echo "[*] Installation complete! Reboot to start the program."
+sleep 2
+sudo systemctl is-active --quiet tagtracker.service
+printf 'Cart service started. Verify RFID capture and both board snapshots in journalctl -u tagtracker.\n'
+printf 'Upload both protocol-v2 sketches before accepting the cart as operational.\n'

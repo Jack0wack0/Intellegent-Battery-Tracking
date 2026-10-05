@@ -1,225 +1,85 @@
-# Offsite Compute — Drive sync & DSLog processing
+# Machine C: scoring and durable Drive ingestion
 
-This component downloads Drive logs (.dslog and .dsevents) from a Google Drive folder, converts them to CSV using the included DSConverter, filters CSVs, and copies results to a local storage path. It's intended to run on a Raspberry Pi or a small Linux VM.
+Python 3.10+ on Linux, with the pinned requirements installed into a virtualenv.
+The new installer replaces units deliberately, verifies required services start, and disables
+the legacy live-source auto-pull timer. Updates are explicit validated releases with rollback.
 
-## What it does
+## Configure
 
-- Authenticates with Google Drive (OAuth) and lists files in a configured Drive folder.
-- Downloads new `.dslog` and `.dsevents` files to `temp/`.
-- Parses `.dsevents` files into a simple CSV entry so they are recorded.
-- Runs `DSConverter.py` to convert `.dslog` files into structured CSVs saved in `csvDSLogs/`.
-- Copies CSVs to a persistent storage location (configurable) and verifies the copy.
-- Runs `filter_csv.py` on non-`dsevents` CSVs to clean/filter data in-place.
-
-## Layout (important files)
-
-- `main.py` — pipeline entrypoint. Orchestrates download -> convert -> copy -> filter.
-- `drive_sync.py` — Google Drive helpers (auth, listing, download).
-- `DSConverter.py` — converts `.dslog` files to CSV using `dslogtocsvlibrary`.
-- `parser.py` — small helpers used for `.dsevents` parsing and DSLog parsing utilities.
-- `filter_csv.py` — CSV post-processing script.
-- `dslogtocsvlibrary/` — local library used by `DSConverter.py` to parse binary `.dslog` files.
-- `battery_scoring/` — Match Score / Health Score calculation engine (see below).
-
-## Battery Health & Match Scoring engine
-
-`battery_scoring/` implements the data model and scoring calculators from
-`FRC_Battery_Health_and_Match_Scoring_Specification.docx` (see
-[Shared/battery_schema.md](../Shared/battery_schema.md) for the full Firebase
-RTDB schema). This runs entirely on MachineC so the Raspberry Pi cart never has
-to do scoring computation or make extra Firebase round-trips for it.
-
-- `models.py` — typed views over the raw `PullMeasurements` / `CBATests` /
-  `Batteries` Firebase records.
-- `score_utils.py` — normalization/freshness-decay/weighted-average helpers.
-- `match_score.py` — Match Score: readiness for the next match, driven by
-  required current voltage plus optional Battery Beak readings.
-- `health_score.py` — Health Score: long-term degradation using
-  internal-resistance/load-voltage trends, CBA capacity SOH, and age/cycles.
-- `scoring_config_v1.json` — versioned weights/thresholds. Nothing is
-  hard-coded; recalibrate by editing this file and bumping `version` (add a
-  new `scoring_config_v{N}.json` and update `CURRENT_VERSION` in `config.py`).
-- `firebase_store.py` — RTDB read/write helpers (`Batteries`, `Cycles`,
-  `PullMeasurements`, `CBATests`, `ScoreSnapshots`).
-- `engine.py` — long-running service: does a full recompute for every
-  enrolled battery on startup, then listens for new `PullMeasurements`/
-  `CBATests` writes and recomputes just the affected battery, writing a new
-  `ScoreSnapshots` entry and refreshing the cached fields under
-  `Batteries/{id}/cache`.
-
-Run it manually for testing:
-
-```bash
-source venv/bin/activate
-python3 -m battery_scoring.engine
+```dotenv
+FIREBASE_DB_BASE_URL=https://YOUR_DATABASE.firebasedatabase.app
+FIREBASE_CREDS_FILE=/absolute/path/to/service-account.json
+GOOGLE_CREDS_PATH=creds/credentials.json
+GOOGLE_TOKEN_PATH=creds/token.json
+DRIVE_FOLDER_ID=YOUR_EXACT_FOLDER_ID
+LOCAL_STORAGE_PATH=/absolute/path/to/mounted/persistent/csvlogs
 ```
 
-The installer creates and enables `offsite-scoring-engine.service` for
-always-on operation; check logs with:
+Both machines and the website must target the same database. Create/mount persistent storage
+before installation; the pipeline refuses to fabricate a missing backup directory on the root
+disk. Authorize Drive interactively once:
 
-```bash
-sudo journalctl -u offsite-scoring-engine.service -f
-```
-
-Uses the same `FIREBASE_DB_BASE_URL` / `FIREBASE_CREDS_FILE` environment
-variables as `FirebaseScraper.py`.
-
-## Prerequisites
-
-- Linux (Raspberry Pi OS / Debian / Ubuntu) or any Linux VM.
-- Python 3.8+ (3.10+ recommended on newer Pis/VMs).
-- pip and virtualenv (recommended).
-- Google OAuth client credentials JSON (created in Google Cloud Console) with Drive API enabled.
-
-Python packages used (examples):
-- google-api-python-client
-- google-auth
-- google-auth-oauthlib
-- python-dotenv
-
-This repository includes the `dslogtocsvlibrary` locally, so you don't need an external `dslogparser` package.
-
-A `requirements.txt` is included in this folder. To install all required packages in one step run:
-
-```bash
-pip install -r requirements.txt
-```
-
-## Environment variables / .env
-
-Create a `.env` file in this folder (or set environment variables system-wide) containing the following values:
-
-```
-GOOGLE_TOKEN_PATH=/creds/token.pickle
-GOOGLE_CREDS_PATH=/creds/credentials.json
-DRIVE_FOLDER_NAME="Folder name in google drive"
-LOCAL_STORAGE_PATH=Backup location
-TEST_DRIVE_FOLDER_ID=FOLDER_ID
-FIREBASE_DB_BASE_URL=https://your-project.firebaseio.com
-FIREBASE_CREDS_FILE=/absolute/path/to/your/firebase-service-account.json
-```
-
-Notes:
-- `GOOGLE_CREDS_PATH` should point to the OAuth client credentials file you download (JSON) from the Google Cloud Console. Place it under a `creds/` subfolder or update the path.
-- On first run the script will open a browser to perform the OAuth flow and create `GOOGLE_TOKEN_PATH` (token.pickle). On a headless Pi, use an SSH port-forward or run the flow on a local machine and copy the token file.
-- `FIREBASE_DB_BASE_URL` and `FIREBASE_CREDS_FILE` are required by the Firebase scraper and battery scoring services. `FIREBASE_CREDS_FILE` must be an absolute path to the service-account JSON file.
-
-## Installation (recommended)
-
-There is an installer script that handles the common setup tasks: creating a virtualenv, installing Python dependencies (from `requirements.txt`), creating a `.env` template, collecting missing Firebase settings, optionally installing Tailscale, and creating systemd units to run the services automatically.
-
-Run the installer:
-
-```bash
-cd MachineC_OffsiteCompute
-chmod +x install.sh
+```sh
+python3 -m venv venv
+venv/bin/python -m pip install -r requirements.txt
+venv/bin/python drive_sync.py --authorize
 ./install.sh
 ```
 
-What the installer does
-- Creates a virtualenv at `MachineC_OffsiteCompute/venv` and installs packages from `requirements.txt` (or falls back to a reasonable default set).
-- Creates a `.env` template in the MachineC folder if you don't already have one and prompts for missing Firebase database and service-account settings. Set the paths and values for `GOOGLE_CREDS_PATH`, `GOOGLE_TOKEN_PATH`, `DRIVE_FOLDER_NAME`, and `LOCAL_STORAGE_PATH` before using the Drive processing service.
-- Optionally installs Tailscale and can bring it up with an auth key if you provide one during the installer prompt.
-- Creates and enables these systemd units:
-	- `offsite-firebase-scraper.service` — long-running service that runs `FirebaseScraper.py` continuously.
-	- `offsite-check.service` — a oneshot service that runs `check_and_run_main.py` (the wrapper that only runs `main.py` when new Drive files are detected).
-	- `offsite-check.timer` — a systemd timer that triggers `offsite-check.service` every 10 minutes and once shortly after boot.
-  - `offsite-github-update.service` and `offsite-github-update.timer` — checks GitHub five minutes after boot and every 30 minutes, applying only fast-forward updates. It leaves any checkout with local edits or commits unchanged and reports the conflict in the service logs.
+Legacy executable `token.pickle` is not loaded. Reauthorize to JSON. Headless deployments can
+authorize locally and copy the resulting private JSON token to the service user's configured path.
 
-Manual alternative
-If you prefer not to run the installer, you can still set things up manually:
+## Scoring
 
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-# create creds/ and place your credentials.json per .env variables
+`offsite-scoring-engine.service` uses algorithm/config version 2. It periodically reconciles
+Batteries, completed Cycles, PullMeasurements and CBATests, including metadata changes and
+age/freshness decay. A renewable writer lease prevents normal simultaneous writers; each score
+snapshot and cache update publishes atomically. Invalid observations are retained as raw data,
+excluded from computation and surfaced in `cache/inputWarnings`. Removing the last valid voltage
+clears readiness instead of retaining the old score. Optional latest values retain individual dates.
+
+`ScoringRevisions/{batteryId}` increments with coordinated writers. History is cached locally
+between revision/metadata changes, reducing repeated lifetime-history downloads. A ten-minute
+full reconciliation covers legacy/admin writes that omitted revision markers. New writes should
+include the marker in the same multipath update. Status is published under `status/Scoring`.
+
+Health uses distinct median baseline/recent windows with sufficient samples, separates resistance
+and capacity dimensions, reduces stale CBA confidence and records the chosen baseline. Values
+are operational defaults requiring team calibration; no exact remaining-life prediction is made.
+Snapshots include configuration, all measurement/CBA/cycle references and a source fingerprint.
+
+`offsite-firebase-scraper.service` reports connectivity only. It never wipes physical charging
+state, invents a removal or deletes battery history after a stale heartbeat.
+
+## Drive
+
+`offsite-check.timer` runs one bounded ingestion pass ten minutes after the previous pass ends.
+A failed stage exits nonzero and is retried. Manual entrypoint: `venv/bin/python main.py`.
+
+Files are identified by Drive ID/revision metadata, not filenames. Listing is paginated; downloads
+are checksum/size validated and atomically published. Raw DS files and full CSV are immutable;
+quality flags and derived current go into separate CSV. Missing/invalid current remains unknown,
+not zero. Truncated/unsupported DS records fail visibly instead of becoming successful partial CSVs.
+Raw and derived artifacts, metadata and hashes are verified in persistent storage before the
+SQLite ledger marks a revision complete. Verified staging copies are then removed. Insufficient
+storage headroom fails visibly; durable raw history is never silently deleted.
+
+Binary dsevents are parsed with exact tagged-ID matching and retain every event/message.
+Unique same-stem log/event pairs produce provenance-rich `.binding.json`; ambiguous/unmatched
+pairs remain unassigned. Robot-generated event text must match the documented `Battery ID:`/
+`Battery Tag:`/`BAT:` convention to identify tags. Actual paired robot logs still require acceptance;
+telemetry is not silently used as a substitute for the required manual measurements.
+
+## Verify and update
+
+```sh
+journalctl -u offsite-scoring-engine.service -f
+journalctl -u offsite-check.service -f
+systemctl list-timers --all
 ```
 
-Then run the components manually as needed (see sections below).
-
-## First run and authentication
-
-On first run the Drive helper (`drive_sync.get_service()`) will attempt to load `GOOGLE_TOKEN_PATH`. If not present it will start an OAuth flow and open a browser to let you grant access. The credentials will then be saved to the `GOOGLE_TOKEN_PATH` file.
-
-On a headless machine (no GUI) you can either:
-- Run the script on a machine with a browser to perform the flow and copy the resulting token file to the Pi/VM; or
-- Temporarily enable X forwarding / run with `run_local_server` (it launches a local server and opens a browser on the host) and complete the auth via an externally accessible browser.
-
-To run the pipeline manually:
-
-```bash
-source venv/bin/activate   # if using virtualenv
-python3 main.py
-```
-
-If you used `install.sh`, the installer created a venv at `venv/`. To test the Drive-check wrapper without waiting for the timer, run:
-
-```bash
-source venv/bin/activate
-python3 check_and_run_main.py
-```
-
-That will authenticate if necessary and only run `main.py` when there are Drive files that are not yet in `exclusionListFP.txt`.
-
-## Running automatically (suggested)
-
-We provide an installer which creates systemd units for two purposes:
-
-- `offsite-firebase-scraper.service` — runs `FirebaseScraper.py` continuously as a service.
-- `offsite-check.service` + `offsite-check.timer` — the timer triggers every 10 minutes (and once shortly after boot) to run `check_and_run_main.py`. The wrapper checks Drive for new `.dslog`/`.dsevents` files and runs `main.py` only when new files are found (i.e. files not already listed in `exclusionListFP.txt`).
-- `offsite-github-update.service` + `offsite-github-update.timer` — the timer checks the repository five minutes after boot and every 30 minutes. The service runs `git pull --ff-only`, so it updates only clean checkouts and never creates an automatic merge.
-
-If you prefer a single long-running service for `main.py` instead of a timer, you can create your own systemd unit similar to the example below and enable it instead of the timer:
-
-```
-[Unit]
-Description=Offsite DSLog processor (manual long-running)
-After=network.target
-
-[Service]
-User=pi
-WorkingDirectory=/home/pi/Intellegent-Battery-Tracking/MachineC_OffsiteCompute
-ExecStart=/home/pi/Intellegent-Battery-Tracking/MachineC_OffsiteCompute/venv/bin/python3 main.py
-Restart=on-failure
-EnvironmentFile=/home/pi/Intellegent-Battery-Tracking/MachineC_OffsiteCompute/.env
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Adjust `User`, `WorkingDirectory`, and `ExecStart` to match your installation paths.
-
-## Output directories
-
-- `temp/` — downloaded Drive files (`.dslog` and `.dsevents`) are placed here.
-- `csvDSLogs/` — generated CSVs from `DSConverter.py` and `.dsevents`-derived CSV entries are saved here.
-- `LOCAL_STORAGE_PATH` — persistent storage location you set (the README's `.env` example uses `/mnt/storage/csvlogs`).
-
-## Troubleshooting
-
-- Authentication errors: ensure `GOOGLE_CREDS_PATH` points to a valid OAuth client JSON and the Drive API is enabled in Google Cloud Console.
-- Headless auth: perform the auth flow on a desktop and copy `token.pickle` to the Pi's `GOOGLE_TOKEN_PATH`.
-- Permission errors when copying: ensure `LOCAL_STORAGE_PATH` is writable by the user running the script.
-- DSLog parsing errors: `DSConverter.py` uses the local `dslogtocsvlibrary` to parse binary logs. If parsing fails, check the stack trace printed by `DSConverter.py` and the `exclusionListFP.txt` to see which files were skipped.
-
-Service & timer troubleshooting
-- Check the FirebaseScraper logs:
-	- `sudo journalctl -u offsite-firebase-scraper.service -f`
-- Check the check service logs (oneshot runs):
-	- `sudo journalctl -u offsite-check.service --since "1 hour ago"`
-- Timer status:
-	- `systemctl list-timers --all | grep offsite-check`
-- Check GitHub update logs or trigger an immediate check:
-  - `sudo journalctl -u offsite-github-update.service --since "1 hour ago"`
-  - `sudo systemctl start offsite-github-update.service`
-
-If you need to run the Drive-check manually (for testing):
-
-```bash
-source venv/bin/activate
-python3 check_and_run_main.py
-```
-
----
+`deploy.sh` checks clean main/fast-forward topology, stages dependencies/tests, stops services
+before source replacement, refreshes dependencies and rolls back on failure. Changed installer/unit
+migrations require reviewed maintenance installation instead of silently retaining old units.
+No live deployment has been performed by the implementation branch. Follow the coordinated
+[`Shared/competition_release.md`](../Shared/competition_release.md) runbook.

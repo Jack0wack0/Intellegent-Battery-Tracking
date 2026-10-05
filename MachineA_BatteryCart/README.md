@@ -1,113 +1,89 @@
-# Battery Tracking System - Machine A (Battery Cart)
+# Machine A: competition cart
 
-This component is part of an intelligent battery tracking system designed to monitor and manage battery charging stations. It runs on a Raspberry Pi and interfaces with Arduino-based RFID readers and LED indicators.
+Runs seven slots by default: Arduino 1 supplies slots 0–5, Arduino 2 supplies slot 6.
+The dedicated RFID scanners act as USB keyboards. Scans are read using Linux evdev and
+are grabbed exclusively, so they do not depend on terminal stdin or Chromium focus.
 
-## Features
+Use Raspberry Pi OS/Debian with Python 3.10+. Upload **both protocol-v2 sketches** before
+running the new collector. The older sketches do not implement initial snapshots or
+correlated command acknowledgments.
 
-- Real-time battery tracking with RFID identification
-- LED status indicators for each charging slot
-- Firebase integration for data storage and synchronization
-- Automatic charge time tracking
-- Smart slot management with next-up recommendations
-- System health monitoring and status updates
+## Configure and install
 
-## Prerequisites
+```sh
+cd MachineA_BatteryCart
+./install.sh
+```
 
-- Raspberry Pi (I have gotten this to run on a pi 3B, but I would recommend a pi4 or better.)
-- 2x Arduino UNO boards
-- Addressable LED strip for status indication
-- Firebase project with Realtime Database
-- Python 3.x
+The installer uses a virtualenv, checks required configuration, grants the service user
+`dialout`/`input` access, replaces the systemd unit deliberately and verifies it starts.
+Choose only dedicated scanner devices: `/dev/input/by-id/*event-kbd`. Do not select a
+normal keyboard. Stable board paths belong in the ignored `hardwareIDS.json`:
 
-## Installation
+```json
+{"COM_PORT1":"/dev/serial/by-id/BOARD_ONE","COM_PORT2":"/dev/serial/by-id/BOARD_TWO"}
+```
 
-1. Clone this repository to your Raspberry Pi using sparse checkout (this downloads only the necessary components):
-   ```bash
-   # Clone the repository without downloading files yet
-   git clone --no-checkout https://github.com/Jack0wack0/Intellegent-Battery-Tracking.git
-   
-   # Move into the repository directory
-   cd Intellegent-Battery-Tracking
-   
-   # Set up sparse checkout to only download required folders
-   git sparse-checkout init --cone
-   git sparse-checkout set MachineA_BatteryCart Shared
-   
-   # Download the specified folders
-   git checkout main
-   ```
+Local `.env`:
 
-2. Firebase credentials and `.env` file
+```dotenv
+FIREBASE_DB_BASE_URL=https://YOUR_DATABASE.firebasedatabase.app
+FIREBASE_CREDS_FILE=/absolute/path/to/service-account.json
+RFID_DEVICES=/dev/input/by-id/SCANNER_ONE-event-kbd,/dev/input/by-id/SCANNER_TWO-event-kbd
+SLOT_COUNT=7
+```
 
-   The included `install.sh` script will prompt you for the Firebase Realtime Database URL and the full path to your Firebase service account JSON file, and it will create a `.env` file for you in the project directory during installation.
+Scanners must emit exactly ten decimal digits followed by Enter. Multiple readers are
+supported, but keyboard scans do not carry slot identity. Insert one battery at a time.
+Ambiguous simultaneous inserts/scans remain unidentified rather than guessing a tag.
 
-   If you prefer to create the `.env` file manually, create a file named `.env` in the project directory with the following contents (replace the placeholders):
+## Durable behavior
 
-   ```bash
-   FIREBASE_DB_BASE_URL=https://your-project.firebaseio.com
-   FIREBASE_CREDS_FILE=/absolute/path/to/your/firebase-credentials.json
-   ```
+`state/cart.sqlite3` contains active sessions and an ordered transactional outbox. A
+session transition and its upload are committed together. No placement/pull calculation
+needs a Firebase read. A pull produces one stable `Cycles` event and `PullRequests` entry;
+open `http://127.0.0.1:8765/` in the Pi browser for immediate enrollment, required pull voltage,
+optional Beak readings and separate CBA tests, including when internet is unavailable.
+The local screen commits receipts and their upload in one SQLite transaction before acknowledging
+a save. `KIOSK_PORT` optionally changes the loopback-only port. Keep the screen open in the pit.
+The authenticated Firebase website also discovers outstanding requests on reconnect, even if
+the battery returned to charging. Competing inputs retain their originals for explicit review.
 
-   Notes:
-   - `FIREBASE_DB_BASE_URL` should be your Firebase Realtime Database URL (for example: `https://your-project.firebaseio.com`).
-   - `FIREBASE_CREDS_FILE` must be an absolute path to the downloaded Firebase service account JSON file on the Raspberry Pi.
+The old `firebase_queue.json` is imported once without deleting the original. Invalid
+JSON or SQLite corruption is a visible failure; never delete the database to "repair"
+a pending queue. Disk exhaustion fails collection visibly and lets the firmware time
+out instead of claiming unpersisted events succeeded. Back up the database using SQLite's
+backup API; copying only the `.sqlite3` while its WAL is active is insufficient.
 
-3. Set up Arduino connections:
-   - Two Arduino boards with RFID readers will be detected during installation
-   - The script will help you identify and configure the correct COM ports
+On boot/reconnect, initially occupied slots are not assumed empty. Existing sessions
+are retained, but battery identity must be reverified by a matching scan or a deliberate
+remove/rescan. Initially occupied unidentified slots need a remove/rescan. Snapshot-based
+removals retain `endTimeEstimated`; clock reversals retain `clockAnomaly` for inspection.
+Sensor flicker during grace preserves the session; an identified different battery is
+a new session. Stable IDs prevent replay from erasing kiosk acknowledgments.
 
-4. Make the install script executable and run it:
-   ```bash
-   cd MachineA_BatteryCart
-   chmod +x install.sh
-   ./install.sh
-   ```
+## LEDs and recommendations
 
-   The installation script will:
-   - Update the system
-   - Install required dependencies
-   - Set up the project directory
-   - Configure Firebase credentials if not already present
-   - Detect and configure Arduino hardware IDs
-   - Create and enable system services for auto-start
-   - Configure a browser to open on boot (optional)
+- Pulsing orange: observed empty.
+- Flashing red: occupied, but identity needs verification.
+- Flashing purple: slot/board state unknown.
+- Solid red: occupied and identified; no verified next-match recommendation.
+- Deep-pulsing green: current recommended pick, based on recent valid Match Score,
+  confidence, enrollment, status and the configured minimum charger time.
+- Purple fallback: the Arduino has not received Pi commands/heartbeats for five seconds.
 
-## Configuration Files
+Elapsed charger time is an operational heuristic, not a direct charge-complete sensor.
+No recommendation is made when settings/metadata/cloud reads, reader health, board health,
+occupancy, identity, score freshness or eligibility cannot be verified. Retired/practice
+batteries can charge, but do not enter the competition recommendation queue.
 
-- `.env`: Contains Firebase credentials
-- `hardwareIDS.json`: Contains Arduino COM port assignments
-- `requirements.txt`: Python package dependencies
+## Verify
 
-## System Services
+```sh
+systemctl status tagtracker.service
+journalctl -u tagtracker.service -f
+```
 
-The installation creates two systemd services:
-1. `tagtracker.service`: Manages the main battery tracking system
-2. `browser.service`: (Optional) Opens a specified webpage on boot
-
-## Operation
-
-Once installed and running, the system will:
-1. Monitor RFID scans from both Arduino readers
-2. Track battery placement and removal from charging slots
-3. Update Firebase with real-time status changes
-4. Manage LED indicators showing slot status:
-   - Orange (pulsing): Slot available
-   - Red (solid): Currently charging
-   - Blue (solid): Charge complete
-   - Green (deep pulse): Next battery to pick
-
-## Troubleshooting
-
-- Check system status: `systemctl status tagtracker.service`
-- View logs: `journalctl -u tagtracker.service`
-- Hardware issues: Check `hardwareIDS.json` for correct COM port assignments
-- Firebase connection: Verify credentials in `.env` file
-- LED sync issues: Check Arduino connections and restart service
-
-## Website health reporting
-
-The Pi heartbeat publishes `status/COM_PORT1`, `status/COM_PORT2`, `status/CPU_Temp`, and `status/LastUpdated` every 10 seconds. The website treats the Pi and Arduino connections as offline when the heartbeat is older than 30 seconds. Serial read failures, repeated LED command failures, LED manager crashes, and heartbeat write failures are queued under `status/CriticalErrors/<timestamp>` for the admin console.
-
-## Support
-
-For issues and support, please create an issue in the repository or contact me.
+A green systemd state alone is insufficient: verify `status/RFID`, both synchronized boards,
+`status/Slots`, `PendingEvents`, and actual scanner/LED behavior. Follow
+[`Shared/competition_release.md`](../Shared/competition_release.md) for acceptance.

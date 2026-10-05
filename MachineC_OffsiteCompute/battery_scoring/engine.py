@@ -1,148 +1,151 @@
-"""Scoring engine service.
-
-Listens to Firebase RTDB for new PullMeasurements/CBATests writes and
-recomputes Match Score + Health Score for the affected battery, writing a new
-ScoreSnapshot and refreshing the cached fields on Batteries/{id}. Runs
-continuously on MachineC (offsite) so the Raspberry Pi cart never has to run
-scoring logic.
-"""
-
+"""Single-writer, periodically reconciled scoring; no fragile background stream callbacks."""
+import hashlib
+import json
 import logging
-import sys
+import os
+import signal
+import threading
 import time
+import uuid
 from datetime import datetime, timezone
-from os import getenv
-
-import dotenv
-import firebase_admin
-from firebase_admin import credentials, db
 
 from . import firebase_store as store
 from .config import CURRENT_VERSION, load_config
 from .health_score import compute_health_score
 from .match_score import compute_match_score
+from .models import PullMeasurement, CBATest
 
-dotenv.load_dotenv()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(name)s] [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger("SCORING_ENGINE")
-
-FIREBASE_DB_BASE_URL = getenv("FIREBASE_DB_BASE_URL")
-FIREBASE_CREDS_FILE = getenv("FIREBASE_CREDS_FILE")
+log = logging.getLogger("scoring")
 
 
-def init_firebase():
-    if not FIREBASE_DB_BASE_URL or not FIREBASE_CREDS_FILE:
-        log.critical("Missing FIREBASE_DB_BASE_URL / FIREBASE_CREDS_FILE in environment.")
-        sys.exit(1)
-    try:
-        firebase_admin.get_app()
-    except ValueError:
-        cred = credentials.Certificate(FIREBASE_CREDS_FILE)
-        firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_BASE_URL})
-    return db.reference("/")
+def recompute_battery(root_ref, battery_id, config, now=None, before_publish=lambda: True, inputs=None, battery_data=None):
+    now = now or datetime.now(timezone.utc)
+    from .models import Battery
+    battery = Battery.from_dict(battery_id, battery_data) if battery_data is not None else store.get_battery(root_ref, battery_id)
+    if inputs is None:
+        inputs = {}
+    if not inputs:
+        inputs.update(raw_measurements=root_ref.child(store.MEASUREMENTS_PATH).child(battery_id).get() or {},
+                      raw_tests=root_ref.child(store.CBA_PATH).child(battery_id).get() or {},
+                      cycles=store.get_cycles(root_ref, battery_id))
+    raw_measurements, raw_tests = inputs['raw_measurements'], inputs['raw_tests']
+    measurements, warnings = store.parse_records(raw_measurements, battery_id, PullMeasurement, now)
+    cba_tests, cba_warnings = store.parse_records(raw_tests, battery_id, CBATest, now)
+    cycles = inputs['cycles']
+    warnings += [f"Cycle {identity}: timestamp estimated or affected by clock change" for identity, cycle in cycles.items()
+                 if cycle.get('clockAnomaly') or cycle.get('endTimeEstimated')]
+    latest = measurements[-1] if measurements else None
+    match = compute_match_score(latest, config, now=now, history=measurements) if latest else None
+    health = compute_health_score(battery, measurements, cba_tests, len(cycles), config, now=now)
+    source = {'measurements': raw_measurements, 'cbaTests': raw_tests, 'cycles': cycles,
+              'metadata': {k: v for k, v in battery.raw.items() if k != 'cache'}, 'config': config}
+    # Fingerprint raw invalid values without publishing them; quarantined NaN cannot block valid history.
+    fingerprint = hashlib.sha256(json.dumps(source, sort_keys=True, default=str).encode()).hexdigest()
+    snapshot = {"timestamp": now.isoformat(), "algorithmVersion": config["version"],
+                "matchScore": match.score if match and match.confidence > 0 else None,
+                "matchConfidence": match.confidence if match else 0,
+                "healthScore": health.score, "healthConfidence": health.confidence,
+                "sourceFingerprint": fingerprint, "config": config,
+                "inputRefs": {"measurementIds": [m.measurement_id for m in measurements],
+                              "cbaTestIds": [t.test_id for t in cba_tests], "cycleIds": sorted(cycles),
+                              "measurementId": latest.measurement_id if latest else None,
+                              "baselineCBATestId": battery.raw.get('baselineCBATestId') or (cba_tests[0].test_id if cba_tests else None)}}
+    if match:
+        snapshot.update(match.to_dict("matchComponents", "matchExplanation"))
+    else:
+        snapshot.update(matchComponents=[], matchExplanation=["No valid dated pull voltage; readiness unknown."])
+    snapshot.update(health.to_dict("healthComponents", "healthExplanation"))
+    seasons = {}
+    for cycle in cycles.values():
+        season = str(cycle.get('season') or cycle['endTime'][:4])
+        seasons[season] = seasons.get(season, 0) + 1
+    cache = {"latestVoltage": latest.current_voltage if latest else None,
+             "latestVoltageAt": latest.timestamp.isoformat() if latest else None,
+             "latestMatchScore": snapshot['matchScore'], "latestMatchConfidence": snapshot['matchConfidence'],
+             "latestHealthScore": health.score, "latestHealthConfidence": health.confidence,
+             "latestCBACapacityAh": cba_tests[-1].capacity_ah if cba_tests else None,
+             "latestCBATestAt": cba_tests[-1].timestamp.isoformat() if cba_tests else None,
+             "totalCycleCount": len(cycles), "seasonCycleCount": seasons,
+             "scoreAlgorithmVersion": config['version'], "sourceFingerprint": fingerprint,
+             "scoreComputedAt": now.isoformat(), "inputWarnings": (warnings + cba_warnings)[:50]}
+    for field, attr in [('latestSOC', 'soc_percent'), ('latestInternalResistanceMilliOhm', 'internal_resistance_milliohm'),
+                        ('latest1AVoltage', 'voltage_1a'), ('latest18AVoltage', 'voltage_18a')]:
+        reading = next((m for m in reversed(measurements) if getattr(m, attr) is not None), None)
+        cache[field] = getattr(reading, attr) if reading else None
+        cache[field + 'At'] = reading.timestamp.isoformat() if reading else None
+    sag = next((m for m in reversed(measurements) if m.voltage_1a is not None and m.voltage_18a is not None), None)
+    cache['latestLoadSag'] = sag.voltage_1a - sag.voltage_18a if sag else None
+    cache['latestLoadSagAt'] = sag.timestamp.isoformat() if sag else None
+    old = battery.raw.get('cache') or {}
+    changed = any(old.get(k) != v for k, v in cache.items() if k != 'scoreComputedAt')
+    if changed:
+        if not before_publish():
+            raise RuntimeError('Scoring writer lease lost; refusing stale publication')
+        store.publish(root_ref, battery_id, snapshot, cache)
+    return snapshot, cache
 
 
-def recompute_battery(root_ref, battery_id: str, config: dict) -> None:
-    measurements = store.list_measurements(root_ref, battery_id)
-    if not measurements:
-        log.debug(f"No valid pull measurements yet for {battery_id}; skipping.")
-        return
-
-    battery = store.get_battery(root_ref, battery_id)
-    cba_tests = store.list_cba_tests(root_ref, battery_id)
-    lifetime_cycles = store.get_lifetime_cycle_count(root_ref, battery_id)
-
-    now = datetime.now(timezone.utc)
-    latest = measurements[-1]
-
-    match_result = compute_match_score(latest, config, now=now)
-    health_result = compute_health_score(battery, measurements, cba_tests, lifetime_cycles, config, now=now)
-
-    snapshot = {
-        "timestamp": now.isoformat(),
-        "algorithmVersion": config["version"],
-        "matchScore": match_result.score,
-        "matchConfidence": match_result.confidence,
-        "healthScore": health_result.score,
-        "healthConfidence": health_result.confidence,
-        "inputRefs": {
-            "measurementId": latest.measurement_id,
-            "cbaTestId": cba_tests[-1].test_id if cba_tests else None,
-        },
-    }
-    snapshot.update(match_result.to_dict("matchComponents", "matchExplanation"))
-    snapshot.update(health_result.to_dict("healthComponents", "healthExplanation"))
-
-    store.write_score_snapshot(root_ref, battery_id, snapshot)
-    store.update_battery_cache(root_ref, battery_id, {
-        "latestVoltage": latest.current_voltage,
-        "latestVoltageAt": latest.timestamp.isoformat() if latest.timestamp else None,
-        "latestSOC": latest.soc_percent,
-        "latestInternalResistanceMilliOhm": latest.internal_resistance_milliohm,
-        "latest1AVoltage": latest.voltage_1a,
-        "latest18AVoltage": latest.voltage_18a,
-        "latestCBACapacityAh": cba_tests[-1].capacity_ah if cba_tests else None,
-        "latestCBATestAt": cba_tests[-1].timestamp.isoformat() if cba_tests and cba_tests[-1].timestamp else None,
-        "latestMatchScore": match_result.score,
-        "latestMatchConfidence": match_result.confidence,
-        "latestHealthScore": health_result.score,
-        "latestHealthConfidence": health_result.confidence,
-        "totalCycleCount": lifetime_cycles,
-        "scoreAlgorithmVersion": config["version"],
-    })
-    log.info(
-        f"{battery_id}: Match={match_result.score} (conf {match_result.confidence}) "
-        f"Health={health_result.score} (conf {health_result.confidence})"
-    )
-
-
-def recompute_all(root_ref, config: dict) -> None:
-    for battery_id in store.list_battery_ids(root_ref):
+def recompute_all(root_ref, config, before_publish=lambda: True, input_cache=None):
+    failures = []
+    batteries = root_ref.child(store.BATTERIES_PATH).get() or {}
+    revisions = root_ref.child('ScoringRevisions').get() or {}
+    if not isinstance(batteries, dict) or not isinstance(revisions, dict):
+        raise ValueError('Invalid battery/revision collection')
+    for identity, battery_data in batteries.items():
         try:
-            recompute_battery(root_ref, battery_id, config)
-        except Exception as e:
-            log.error(f"Failed to recompute scores for {battery_id}: {e}")
+            entry = input_cache.get(identity) if input_cache is not None else None
+            metadata = {k: v for k, v in battery_data.items() if k != 'cache'}
+            refresh = entry is None or entry['revision'] != revisions.get(identity) or entry['metadata'] != metadata or time.monotonic() - entry['readAt'] >= 600
+            if refresh:
+                entry = {'inputs': {}, 'revision': revisions.get(identity), 'metadata': metadata, 'readAt': time.monotonic()}
+            recompute_battery(root_ref, identity, config, before_publish=before_publish,
+                              inputs=entry['inputs'], battery_data=battery_data)
+            if input_cache is not None:
+                input_cache[identity] = entry
+        except Exception:
+            failures.append(identity)
+            log.exception('Battery %s failed; retrying next reconciliation', identity)
+    return failures
 
 
-def _battery_id_from_event_path(path: str):
-    # RTDB stream events fire with path like "/{batteryId}" or "/{batteryId}/{childId}".
-    parts = [p for p in path.split("/") if p]
-    return parts[0] if parts else None
+class WriterLease:
+    def __init__(self, root):
+        self.reference = root.child('ScoreEngineLease')
+        self.owner = uuid.uuid4().hex
+
+    def renew(self):
+        now = time.time()
+        def update(current):
+            if current and current.get('owner') != self.owner and current.get('expires', 0) > now:
+                return current
+            return {'owner': self.owner, 'expires': now + 60}
+        result = self.reference.transaction(update)
+        return isinstance(result, dict) and result.get('owner') == self.owner
 
 
 def main():
-    root_ref = init_firebase()
-    config = load_config(CURRENT_VERSION)
-    log.info(f"Scoring engine started (algorithm v{config['version']}).")
-
-    log.info("Running initial full recompute for all enrolled batteries...")
-    recompute_all(root_ref, config)
-
-    def on_measurement_event(event):
-        battery_id = _battery_id_from_event_path(event.path)
-        if battery_id:
-            recompute_battery(root_ref, battery_id, config)
-
-    def on_cba_event(event):
-        battery_id = _battery_id_from_event_path(event.path)
-        if battery_id:
-            recompute_battery(root_ref, battery_id, config)
-
-    root_ref.child(store.MEASUREMENTS_PATH).listen(on_measurement_event)
-    root_ref.child(store.CBA_PATH).listen(on_cba_event)
-    log.info("Listening for PullMeasurements/CBATests changes. Ctrl+C to stop.")
-
-    try:
-        while True:
-            time.sleep(60)
-    except KeyboardInterrupt:
-        log.info("Shutting down scoring engine.")
+    import dotenv
+    import firebase_admin
+    from firebase_admin import credentials, db
+    dotenv.load_dotenv()
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    firebase_admin.initialize_app(credentials.Certificate(os.environ['FIREBASE_CREDS_FILE']),
+                                  {'databaseURL': os.environ['FIREBASE_DB_BASE_URL'], 'httpTimeout': 10})
+    root = db.reference('/')
+    config, stop = load_config(CURRENT_VERSION), threading.Event()
+    lease, input_cache = WriterLease(root), {}
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: stop.set())
+    while not stop.is_set():
+        try:
+            if lease.renew():
+                failures = recompute_all(root, config, before_publish=lease.renew, input_cache=input_cache)
+                root.child('status/Scoring').update({'LastUpdated': datetime.now(timezone.utc).isoformat(),
+                                                    'AlgorithmVersion': config['version'], 'FailedBatteryIds': failures})
+        except Exception:
+            log.exception('Scoring reconciliation failed; will retry')
+        stop.wait(15)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

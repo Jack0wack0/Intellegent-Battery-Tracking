@@ -16,3 +16,9 @@ __pycache__/
 .env.*
 *.pickle
 firebase_queue.json
+
+# Durable runtime data belongs on the machines, not in Git.
+**/state/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm

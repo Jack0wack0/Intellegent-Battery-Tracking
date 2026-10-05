@@ -35,22 +35,20 @@ class EventEntry(GenericEntry):
         text = struct.unpack(f">{self.message_length}s", data)[0].decode(
             "ascii", "backslashreplace"
         )
-        self.message = text
+        self.raw_message = text
         matches: list[re.Match] = list(re.finditer(self.message_pattern, text))
         message = {}
         for index in range(len(matches)):
             match = matches[index]
             key = text[match.start() + 1 : match.end() - 1]
             if index == len(matches) - 1:
-                value_stop = len(text) - 1
+                value_stop = len(text)
             else:
                 next_match = matches[index + 1]
-                value_stop = next_match.start() - 1
-            value_start = match.end() + 1
+                value_stop = next_match.start()
+            value_start = match.end()
             is_version = key == "TagVersion"
-            if is_version:
-                value_start -= 1
-            value = text[value_start:value_stop]
+            value = text[value_start:value_stop].strip()
             if is_version:
                 value = int(value)
                 if value != 1:

@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from typing import Optional
+import math
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -13,8 +14,8 @@ def normalize_linear(value: float, low: float, high: float, invert: bool = False
 
     If invert is True, lower raw values score higher (e.g. internal resistance).
     """
-    if high == low:
-        return 50.0
+    if not all(math.isfinite(v) for v in (value, low, high)) or high <= low:
+        raise ValueError("Normalization requires finite values and an increasing range")
     pct = (value - low) / (high - low)
     pct = clamp(pct, 0.0, 1.0)
     if invert:
@@ -28,6 +29,8 @@ def freshness_weight(timestamp: Optional[datetime], now: Optional[datetime], ful
         return 0.0
     now = now or datetime.now(timezone.utc)
     age_hours = (now - timestamp).total_seconds() / 3600.0
+    if age_hours < -5 / 60:
+        return 0.0
     if age_hours <= full_weight_hours:
         return 1.0
     if age_hours >= zero_weight_hours:

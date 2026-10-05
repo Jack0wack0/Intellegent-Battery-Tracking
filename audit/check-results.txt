@@ -1,0 +1,231 @@
+test_ctre_currents_do_not_bleed_between_channels (__main__.AuditChecks.test_ctre_currents_do_not_bleed_between_channels) ... FAIL
+test_drive_filename_cannot_escape_temp_dir (__main__.AuditChecks.test_drive_filename_cannot_escape_temp_dir) ... FAIL
+test_drive_listing_uses_pagination (__main__.AuditChecks.test_drive_listing_uses_pagination) ... FAIL
+test_fast_ack_is_not_cleared (__main__.AuditChecks.test_fast_ack_is_not_cleared) ... FAIL
+test_filter_flags_impossible_voltage (__main__.AuditChecks.test_filter_flags_impossible_voltage) ... FAIL
+test_filter_honors_output_path (__main__.AuditChecks.test_filter_honors_output_path) ... FAIL
+test_filter_repeat_preserves_current (__main__.AuditChecks.test_filter_repeat_preserves_current) ... FAIL
+test_health_trend_detects_change_at_five_samples (__main__.AuditChecks.test_health_trend_detects_change_at_five_samples) ... FAIL
+test_invalid_voltage_is_rejected (__main__.AuditChecks.test_invalid_voltage_is_rejected) ... FAIL
+test_missing_optional_fields_are_not_zero_penalties (__main__.AuditChecks.test_missing_optional_fields_are_not_zero_penalties) ... ok
+test_missing_timestamp_not_treated_as_fresh (__main__.AuditChecks.test_missing_timestamp_not_treated_as_fresh) ... FAIL
+test_nonfinite_voltage_is_rejected (__main__.AuditChecks.test_nonfinite_voltage_is_rejected) ... FAIL
+test_normalization_bounds (__main__.AuditChecks.test_normalization_bounds) ... ok
+test_rfid_input_with_service_stdin_closed (__main__.AuditChecks.test_rfid_input_with_service_stdin_closed) ... FAIL
+test_root_stream_event_identifies_affected_batteries (__main__.AuditChecks.test_root_stream_event_identifies_affected_batteries) ... FAIL
+test_serial_reader_reopens_after_unplug (__main__.AuditChecks.test_serial_reader_reopens_after_unplug) ... Serial read error on fake: unplug. Attempting to reconnect...
+FAIL
+test_stale_measurement_has_no_confidence_on_recompute (__main__.AuditChecks.test_stale_measurement_has_no_confidence_on_recompute) ... ok
+test_wal_corrupt_file_requires_recovery (__main__.AuditChecks.test_wal_corrupt_file_requires_recovery) ... Failed to load queue from /var/folders/wl/26v1wffd50xbbktdt42f8pnh0000gn/T/tmp1hdhi60a/queue.json: Expecting value: line 1 column 10 (char 9)
+FAIL
+test_wal_failed_write_preserves_order (__main__.AuditChecks.test_wal_failed_write_preserves_order) ... [WAL] ✗ update to battery failed: temporary outage (will retry)
+[WAL] 1 item(s) remain in queue and will be retried.
+FAIL
+test_wal_reports_disk_failure (__main__.AuditChecks.test_wal_reports_disk_failure) ... Failed to save queue to /var/folders/wl/26v1wffd50xbbktdt42f8pnh0000gn/T/tmp68j2dvqk/missing/queue.json: [Errno 2] No such file or directory: '/var/folders/wl/26v1wffd50xbbktdt42f8pnh0000gn/T/tmp68j2dvqk/missing/queue.json'
+FAIL
+test_wal_retains_enqueue_during_flush (__main__.AuditChecks.test_wal_retains_enqueue_during_flush) ... FAIL
+
+======================================================================
+FAIL: test_ctre_currents_do_not_bleed_between_channels (__main__.AuditChecks.test_ctre_currents_do_not_bleed_between_channels)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Volumes/External/Developer/Projects/Intellegent-Battery-Tracking/audit/reproduce_findings.py", line 130, in test_ctre_currents_do_not_bleed_between_channels
+    self.assertEqual(PdpCtreData.from_bytes(data).currents, [1.0] * 16)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: [1.0, 1025.0, 1049601.0, 1074791425.0, 110058641[135 chars]25.0] != [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.[27 chars] 1.0]
+
+First differing element 1:
+1025.0
+1.0
+
++ [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+- [1.0,
+-  1025.0,
+-  1049601.0,
+-  1074791425.0,
+-  1100586419201.0,
+-  1127000493261825.0,
+-  1.0,
+-  1025.0,
+-  1049601.0,
+-  1074791425.0,
+-  1100586419201.0,
+-  1127000493261825.0,
+-  1.0,
+-  1025.0,
+-  1049601.0,
+-  1074791425.0]
+
+======================================================================
+FAIL: test_drive_filename_cannot_escape_temp_dir (__main__.AuditChecks.test_drive_filename_cannot_escape_temp_dir)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Volumes/External/Developer/Projects/Intellegent-Battery-Tracking/audit/reproduce_findings.py", line 223, in test_drive_filename_cannot_escape_temp_dir
+    self.assertTrue(target.is_relative_to(self.directory / 'temp'))
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: False is not true
+
+======================================================================
+FAIL: test_drive_listing_uses_pagination (__main__.AuditChecks.test_drive_listing_uses_pagination)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Volumes/External/Developer/Projects/Intellegent-Battery-Tracking/audit/reproduce_findings.py", line 218, in test_drive_listing_uses_pagination
+    self.assertEqual(len(fn(Service(), 'folder')), 2, 'second Drive page is never fetched')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 1 != 2 : second Drive page is never fetched
+
+======================================================================
+FAIL: test_fast_ack_is_not_cleared (__main__.AuditChecks.test_fast_ack_is_not_cleared)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Volumes/External/Developer/Projects/Intellegent-Battery-Tracking/audit/reproduce_findings.py", line 194, in test_fast_ack_is_not_cleared
+    self.assertTrue(ns['wait_for_ack'](timeout=0), 'ACK already received was discarded')
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: False is not true : ACK already received was discarded
+
+======================================================================
+FAIL: test_filter_flags_impossible_voltage (__main__.AuditChecks.test_filter_flags_impossible_voltage)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Volumes/External/Developer/Projects/Intellegent-Battery-Tracking/audit/reproduce_findings.py", line 122, in test_filter_flags_impossible_voltage
+    self.assertFalse(rows, 'impossible voltage remains unflagged in output')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: [{'date': 'now', 'voltage': '255.6', 'total_current': '3'}] is not false : impossible voltage remains unflagged in output
+
+======================================================================
+FAIL: test_filter_honors_output_path (__main__.AuditChecks.test_filter_honors_output_path)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Volumes/External/Developer/Projects/Intellegent-Battery-Tracking/audit/reproduce_findings.py", line 104, in test_filter_honors_output_path
+    self.assertEqual(src.read_bytes(), original, 'raw source was overwritten')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: b'date,voltage,total_current\r\nnow,12.5,3\r\n' != b'date,voltage,pdp_data_currents\nnow,12.5,"[1, 2]"\n' : raw source was overwritten
+
+======================================================================
+FAIL: test_filter_repeat_preserves_current (__main__.AuditChecks.test_filter_repeat_preserves_current)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Volumes/External/Developer/Projects/Intellegent-Battery-Tracking/audit/reproduce_findings.py", line 114, in test_filter_repeat_preserves_current
+    self.assertEqual(float(row['total_current']), 3, 'second pass replaced current with zero')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0.0 != 3 : second pass replaced current with zero
+
+======================================================================
+FAIL: test_health_trend_detects_change_at_five_samples (__main__.AuditChecks.test_health_trend_detects_change_at_five_samples)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Volumes/External/Developer/Projects/Intellegent-Battery-Tracking/audit/reproduce_findings.py", line 136, in test_health_trend_detects_change_at_five_samples
+    self.assertGreater(change, 0, 'identical windows hide a large resistance increase')
+    ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0.0 not greater than 0 : identical windows hide a large resistance increase
+
+======================================================================
+FAIL: test_invalid_voltage_is_rejected (__main__.AuditChecks.test_invalid_voltage_is_rejected)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Volumes/External/Developer/Projects/Intellegent-Battery-Tracking/audit/reproduce_findings.py", line 139, in test_invalid_voltage_is_rejected
+    with self.assertRaises((TypeError, ValueError)):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (<class 'TypeError'>, <class 'ValueError'>) not raised
+
+======================================================================
+FAIL: test_missing_timestamp_not_treated_as_fresh (__main__.AuditChecks.test_missing_timestamp_not_treated_as_fresh)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Volumes/External/Developer/Projects/Intellegent-Battery-Tracking/audit/reproduce_findings.py", line 149, in test_missing_timestamp_not_treated_as_fresh
+    self.assertEqual(result.confidence, 0, 'undated voltage received fresh confidence')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0.45 != 0 : undated voltage received fresh confidence
+
+======================================================================
+FAIL: test_nonfinite_voltage_is_rejected (__main__.AuditChecks.test_nonfinite_voltage_is_rejected)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Volumes/External/Developer/Projects/Intellegent-Battery-Tracking/audit/reproduce_findings.py", line 143, in test_nonfinite_voltage_is_rejected
+    with self.assertRaises((TypeError, ValueError)):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (<class 'TypeError'>, <class 'ValueError'>) not raised
+
+======================================================================
+FAIL: test_rfid_input_with_service_stdin_closed (__main__.AuditChecks.test_rfid_input_with_service_stdin_closed)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Volumes/External/Developer/Projects/Intellegent-Battery-Tracking/audit/reproduce_findings.py", line 229, in test_rfid_input_with_service_stdin_closed
+    fn()
+    ~~^^
+  File "MachineA_BatteryCart/input_listener.py", line 567, in listen_rfid
+    tag_buffer = input().strip() #read the input and add it to a buffer variable
+                 ~~~~~^^
+  File "/Volumes/External/Developer/Projects/Intellegent-Battery-Tracking/audit/reproduce_findings.py", line 226, in <lambda>
+    ns = {'input': lambda: (_ for _ in ()).throw(EOFError('systemd stdin=/dev/null'))}
+                           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Volumes/External/Developer/Projects/Intellegent-Battery-Tracking/audit/reproduce_findings.py", line 226, in <genexpr>
+    ns = {'input': lambda: (_ for _ in ()).throw(EOFError('systemd stdin=/dev/null'))}
+EOFError: systemd stdin=/dev/null
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Volumes/External/Developer/Projects/Intellegent-Battery-Tracking/audit/reproduce_findings.py", line 231, in test_rfid_input_with_service_stdin_closed
+    self.fail('RFID loop crashes with installed service stdin')
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: RFID loop crashes with installed service stdin
+
+======================================================================
+FAIL: test_root_stream_event_identifies_affected_batteries (__main__.AuditChecks.test_root_stream_event_identifies_affected_batteries)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Volumes/External/Developer/Projects/Intellegent-Battery-Tracking/audit/reproduce_findings.py", line 199, in test_root_stream_event_identifies_affected_batteries
+    self.assertIsNotNone(fn('/'), 'root patch/initial events are ignored by callbacks')
+    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: unexpectedly None : root patch/initial events are ignored by callbacks
+
+======================================================================
+FAIL: test_serial_reader_reopens_after_unplug (__main__.AuditChecks.test_serial_reader_reopens_after_unplug)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Volumes/External/Developer/Projects/Intellegent-Battery-Tracking/audit/reproduce_findings.py", line 183, in test_serial_reader_reopens_after_unplug
+    self.assertGreater(len(opened), 1, 'handler returned without reconnecting')
+    ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 1 not greater than 1 : handler returned without reconnecting
+
+======================================================================
+FAIL: test_wal_corrupt_file_requires_recovery (__main__.AuditChecks.test_wal_corrupt_file_requires_recovery)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Volumes/External/Developer/Projects/Intellegent-Battery-Tracking/audit/reproduce_findings.py", line 96, in test_wal_corrupt_file_requires_recovery
+    with self.assertRaises((ValueError, OSError)):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (<class 'ValueError'>, <class 'OSError'>) not raised
+
+======================================================================
+FAIL: test_wal_failed_write_preserves_order (__main__.AuditChecks.test_wal_failed_write_preserves_order)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Volumes/External/Developer/Projects/Intellegent-Battery-Tracking/audit/reproduce_findings.py", line 85, in test_wal_failed_write_preserves_order
+    self.assertFalse(remote['IsCharging'], 'older retry overwrote newer removal')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: True is not false : older retry overwrote newer removal
+
+======================================================================
+FAIL: test_wal_reports_disk_failure (__main__.AuditChecks.test_wal_reports_disk_failure)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Volumes/External/Developer/Projects/Intellegent-Battery-Tracking/audit/reproduce_findings.py", line 90, in test_wal_reports_disk_failure
+    with self.assertRaises(OSError):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^
+AssertionError: OSError not raised
+
+======================================================================
+FAIL: test_wal_retains_enqueue_during_flush (__main__.AuditChecks.test_wal_retains_enqueue_during_flush)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Volumes/External/Developer/Projects/Intellegent-Battery-Tracking/audit/reproduce_findings.py", line 67, in test_wal_retains_enqueue_during_flush
+    self.assertEqual(q.size(), 1, 'concurrent enqueue was silently discarded')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 1 : concurrent enqueue was silently discarded
+
+----------------------------------------------------------------------
+Ran 21 tests in 0.023s
+
+FAILED (failures=18)

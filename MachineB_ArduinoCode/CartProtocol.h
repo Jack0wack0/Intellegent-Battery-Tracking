@@ -4,10 +4,16 @@
 #include <FastLED.h>
 // Seven active segments end at pixel 53; avoid reserving 900 bytes for 300 pixels.
 // For a larger cart, change both constants and the Pi's explicit slot/position configuration.
-#define NUM_LEDS 60
-#define NUM_SEGMENTS 7
+#ifndef CART_SLOT_COUNT
+#define CART_SLOT_COUNT 7
+#endif
+#if CART_SLOT_COUNT < 1 || CART_SLOT_COUNT > 12
+#error "CART_SLOT_COUNT must be between 1 and 12"
+#endif
+#define NUM_LEDS (CART_SLOT_COUNT <= 7 ? 60 : 100)
+#define NUM_SEGMENTS CART_SLOT_COUNT
 CRGB leds[NUM_LEDS];
-struct Segment { int position; uint8_t hue; uint8_t mode; };
+struct Segment { int position; uint8_t hue; uint8_t mode; unsigned long updated; };
 Segment segments[NUM_SEGMENTS];
 #endif
 
@@ -15,6 +21,7 @@ const uint8_t sensorPins[6] = {A0, A1, A2, A3, A4, A5};
 bool stableState[6], candidateState[6];
 unsigned long changedAt[6];
 unsigned long lastCommand = 0;
+unsigned long lastLedCommand = 0;
 bool connected = false;
 char commandBuffer[112];
 uint8_t commandLength = 0;
@@ -27,6 +34,9 @@ void emitSlot(uint8_t index) {
 
 void snapshot() {
   Serial.print("BEGIN "); Serial.print(BOARD_ID); Serial.println(" V2");
+#ifdef CART_LEDS
+  Serial.print("LAYOUT "); Serial.print(NUM_SEGMENTS); Serial.print(" "); Serial.println(NUM_LEDS);
+#endif
   for (uint8_t i=0; i<6; i++) emitSlot(i);
   Serial.print("END "); Serial.println(BOARD_ID);
 }
@@ -39,7 +49,10 @@ bool validIdentity(const char* value) {
 
 void handleCommand(char* line) {
   if (strcmp(line, "PING") == 0) {
-    lastCommand = millis(); connected = true; Serial.println("PONG"); return;
+    lastCommand = millis(); connected = true;
+    uint8_t mask=0;
+    for (uint8_t i=0; i<6; i++) if (stableState[i]) mask |= (1 << i);
+    Serial.print("PONG "); Serial.println(mask); return;
   }
   if (strcmp(line, "SNAPSHOT") == 0) { snapshot(); return; }
 #ifdef CART_LEDS
@@ -55,8 +68,9 @@ void handleCommand(char* line) {
   else if (strcmp(mode, "DEEPPULSE") == 0) modeId=3;
   if (parsed == 5 && validIdentity(identity) && segment >= 0 && segment < NUM_SEGMENTS &&
       position >= 0 && position + 5 <= NUM_LEDS && hue >= 0 && hue <= 255 && modeId != 255) {
-    segments[segment] = {position, (uint8_t)hue, modeId};
+    segments[segment] = {position, (uint8_t)hue, modeId, millis()};
     lastCommand=millis(); connected=true;
+    lastLedCommand=millis();
     Serial.print("ACK "); Serial.println(identity); return;
   }
 #endif
@@ -73,7 +87,7 @@ void setup() {
 #ifdef CART_LEDS
   FastLED.addLeds<WS2812B, 3, GRB>(leds, NUM_LEDS);
   FastLED.setBrightness(100);
-  for (uint8_t i=0; i<NUM_SEGMENTS; i++) segments[i] = {i*8, 200, 1};
+  for (uint8_t i=0; i<NUM_SEGMENTS; i++) segments[i] = {i*8, 200, 1, 0};
 #endif
   delay(200);
   snapshot();
@@ -105,12 +119,16 @@ void loop() {
   if (millis()-lastCommand > 5000) connected=false;
 #ifdef CART_LEDS
   FastLED.clear();
-  if (!connected) fill_solid(leds, NUM_LEDS, CRGB(60,0,80));
+  if (!connected || millis()-lastLedCommand > 10000) fill_solid(leds, NUM_LEDS, CRGB(60,0,80));
   else {
     uint8_t phase=(now / 12) % 256;
     uint8_t triangle=phase<128 ? phase*2 : (255-phase)*2;
     for (uint8_t i=0; i<NUM_SEGMENTS; i++) {
       Segment &s=segments[i];
+      if (millis()-s.updated > 10000) {
+        for (uint8_t j=0; j<5; j++) leds[s.position+j]=CRGB(60,0,80);
+        continue;
+      }
       uint8_t brightness = s.mode==0 ? 255 : s.mode==1 ? ((now/200)%2 ? 255:0) :
                            s.mode==2 ? 51+((uint16_t)triangle*204)/255 : triangle;
       for (uint8_t j=0; j<5; j++) leds[s.position+j]=CHSV(s.hue,255,brightness);

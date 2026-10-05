@@ -60,7 +60,7 @@ def completed_cycles(data):
             from .models import _parse_timestamp
             end = _parse_timestamp(raw['endTime'])
             start = _parse_timestamp(raw.get('startTime'))
-            if end and (start is None or end >= start):
+            if end and (start is None or end >= start or (raw.get('completed') is True and raw.get('clockAnomaly') is True)):
                 result[identity] = raw
         except (ValueError, TypeError):
             continue

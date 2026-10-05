@@ -11,11 +11,14 @@ import struct
 import sys
 import tempfile
 import threading
+import subprocess
 import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / 'MachineA_BatteryCart'), str(ROOT / 'MachineC_OffsiteCompute')]
+sys.path.insert(0, str(ROOT / 'Shared'))
+from migrate_legacy_cycles import plan as migration_plan
 from wal import LocalQueue
 from cart_state import CartState, pick_next
 from input_listener import SerialWorker, RFIDReader, led_loop
@@ -24,7 +27,7 @@ from battery_scoring.models import PullMeasurement, Battery
 from battery_scoring.match_score import compute_match_score
 from battery_scoring.health_score import _trend_change_pct, compute_health_score
 from battery_scoring.firebase_store import parse_records, completed_cycles
-from battery_scoring.engine import recompute_battery
+from battery_scoring.engine import recompute_battery, recompute_all
 from dslogtocsvlibrary.entry.pdp_ctre_data import PdpCtreData
 from dslogtocsvlibrary.entry.metadata import Metadata
 from dslogtocsvlibrary.entry.log_entry import LogEntry
@@ -64,6 +67,8 @@ class Reference:
             parts='/'.join(filter(None,[self.path,key])).split('/')
             for part in parts[:-1]: node=node.setdefault(part,{})
             if value is None: node.pop(parts[-1],None)
+            elif isinstance(value,dict) and value.get('.sv') == {'increment':1}:
+                node[parts[-1]]=node.get(parts[-1],0)+1
             else: node[parts[-1]]=copy.deepcopy(value)
     def set(self, value):
         if self.write: self.write(self.path,value)
@@ -72,11 +77,84 @@ class Reference:
         for part in parts[:-1]: node=node.setdefault(part,{})
         node[parts[-1]]=copy.deepcopy(value)
     def order_by_child(self, key): return self
+    def transaction(self, callback):
+        value = callback(self.get())
+        self.set(value)
+        return value
     def equal_to(self, value): return self
     def push(self): return self.child('snapshot')
 
 
 class ReliabilityTests(unittest.TestCase):
+    def test_cba_csv_dry_plan_deduplicates_and_rejects_invalid_rows(self):
+        from import_cba_csv import plan
+        path=self.root/'cba.csv'
+        row='1234567890,2026-10-05T12:00:00Z,17,2026,bench test\n'
+        path.write_text('battery_id,timestamp,capacity_ah,season,notes\n'+row+row)
+        updates=plan(path)
+        self.assertEqual(len(updates),1)
+        record=next(iter(updates.values()))
+        self.assertEqual(record['capacityAh'],17)
+        self.assertEqual(len(record['source']['sha256']),64)
+        path.write_text(path.read_text()+row.replace(',17,',',NaN,'))
+        with self.assertRaises(ValueError): plan(path)
+
+    def test_local_kiosk_offline_enroll_pull_restart(self):
+        from local_kiosk import KioskStore
+        kiosk = KioskStore(self.q, self.state)
+        self.insert()
+        self.assertEqual(kiosk.snapshot()['enrollmentRequests'], ['1234567890'])
+        kiosk.enroll({'id':'1234567890','name':'Pit A','brand':'Test','purchaseDate':'2025-01-01'})
+        self.state.presence(0, False); self.clock.advance(4); self.state.tick()
+        identity = next(iter(kiosk.snapshot()['pullRequests']))
+        request = {'kind':'pull','id':identity,'batteryId':'1234567890','currentVoltage':12.7}
+        saved = kiosk.observation(request)
+        self.assertIsNone(saved['socPercent'])
+        size = self.q.size()
+        self.assertEqual(kiosk.observation({**request,'currentVoltage':11}), saved)
+        self.assertEqual(self.q.size(), size)
+        other = LocalQueue(self.root/'cart.sqlite3')
+        try:
+            self.assertEqual(KioskStore(other,self.state).snapshot()['pullRequests'], {})
+            self.assertEqual(other.records('pull_measurements')[identity]['currentVoltage'],12.7)
+        finally: other.close()
+        remote=Reference(); self.q.process(remote)
+        self.assertEqual(self.q.size(),0)
+        self.assertEqual(remote.data['Cycles'][identity]['pullMeasurementId'],identity)
+        self.assertEqual(remote.data['PullMeasurements']['1234567890'][identity]['currentVoltage'],12.7)
+
+    def test_local_kiosk_validation_cba_and_conflict(self):
+        from local_kiosk import KioskStore
+        kiosk=KioskStore(self.q,self.state)
+        for purchased in ('2025-02-30','2999-01-01'):
+            with self.assertRaises(ValueError): kiosk.enroll({'id':'1234567890','name':'A','brand':'B','purchaseDate':purchased})
+        kiosk.enroll({'id':'1234567890','name':'A','brand':'B','purchaseDate':'2025-01-01'})
+        data={'id':'testA','kind':'cba','batteryId':'1234567890','capacityAh':17,'season':'2026'}
+        for capacity in (True,float('nan'),0,101):
+            with self.assertRaises(ValueError): kiosk.observation({**data,'capacityAh':capacity})
+        kiosk.observation(data)
+        remote=Reference({'CBATests':{'1234567890':{'testA':{'capacityAh':15,'season':'2026'}}}})
+        self.q.process(remote)
+        self.assertEqual(self.q.size(),0)
+        self.assertEqual(self.q.records('cba_tests')['testA']['capacityAh'],17)
+        self.assertEqual(self.q.records('conflicts')['testA']['serverRecord']['capacityAh'],15)
+
+    def test_local_kiosk_remote_receipt_reconciliation(self):
+        from local_kiosk import KioskStore
+        self.q.put_record('pull_requests','cycle',{'batteryId':'1234567890'})
+        root=Reference({'Cycles':{'cycle':{'pullMeasurementId':'correction'}},'PullMeasurements':{'1234567890':{'correction':{'cycleId':'cycle','currentVoltage':12.5}}}})
+        KioskStore(self.q,self.state).reconcile(root)
+        self.assertEqual(self.q.pending_pulls(),{})
+        self.assertEqual(self.q.records('pull_measurements')['cycle']['currentVoltage'],12.5)
+
+    def test_local_observation_repairs_ack_retry_without_overwriting_correction(self):
+        record={'cycleId':'cycle','currentVoltage':12.7,'timestamp':'2026-10-05T12:00:00Z'}
+        root=Reference({'Cycles':{'cycle':{'pullMeasurementId':'corrected'}}})
+        value={'id':'cycle','batteryId':'1234567890','kind':'pull','path':'PullMeasurements/1234567890/cycle','record':record}
+        self.q.upload_observation(root,value); self.q.upload_observation(root,value)
+        self.assertEqual(root.data['Cycles']['cycle']['pullMeasurementId'],'corrected')
+        self.assertEqual(len(root.data['PullMeasurements']['1234567890']),1)
+
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name)
@@ -102,6 +180,44 @@ class ReliabilityTests(unittest.TestCase):
         self.q.enqueue('b',{'v':1}); other=LocalQueue(self.root/'cart.sqlite3')
         try: self.assertEqual(other.size(),1)
         finally: other.close()
+    def test_unclean_process_exit_retains_outbox(self):
+        target=self.root/'crash.sqlite3'
+        code='import sys,os; sys.path.insert(0,sys.argv[1]); from wal import LocalQueue; q=LocalQueue(sys.argv[2]); [q.enqueue("b",{"n":n}) for n in range(10)]; os._exit(0)'
+        subprocess.run([sys.executable,'-c',code,str(ROOT/'MachineA_BatteryCart'),str(target)],check=True)
+        recovered=LocalQueue(target)
+        try: self.assertEqual(recovered.size(),10)
+        finally: recovered.close()
+    def test_disk_full_fails_visibly_and_rolls_back_state(self):
+        current=self.q.connection.execute('PRAGMA page_count').fetchone()[0]
+        self.q.connection.execute(f'PRAGMA max_page_count={current+1}')
+        with self.assertRaises(sqlite3.OperationalError):
+            with self.q.transaction():
+                self.q.set_state('session','new')
+                self.q.enqueue('b',{'payload':'x'*100000})
+        self.assertIsNone(self.q.get_state('session'))
+        self.assertEqual(self.q.size(),0)
+    def test_corrupt_sqlite_is_not_silently_reinitialized(self):
+        source=self.root/'corrupt.sqlite3'; source.write_bytes(b'not a database')
+        with self.assertRaises(sqlite3.DatabaseError): LocalQueue(source)
+        self.assertEqual(source.read_bytes(),b'not a database')
+    def test_serial_reader_reopens_after_unplug(self):
+        stop=threading.Event(); opened=[]
+        class Port:
+            def __init__(self,broken):
+                self.broken=broken
+                self.lines=[b'BEGIN 1 V2\n',b'LAYOUT 7 60\n']+[f'SLOT_{i}:REMOVED\n'.encode() for i in range(6)]+[b'END 1\n']
+            def write(self,value): return len(value)
+            def read_until(self,*args,**kwargs):
+                if self.broken: raise OSError('unplug')
+                if self.lines: return self.lines.pop(0)
+                stop.set(); return b''
+            def close(self): pass
+        def factory(*args,**kwargs): opened.append(True); return Port(len(opened)==1)
+        worker=SerialWorker('fake',1,self.state,stop,serial_factory=factory)
+        # Retry wait is shortened only in the fake, while real state/timeouts still execute.
+        original=stop.wait
+        stop.wait=lambda timeout=None: original(0)
+        worker.run(); self.assertEqual(len(opened),2); self.assertIsNone(worker.port)
     def test_outbox_invalid_operation_visible(self):
         with self.assertRaises(ValueError): self.q.enqueue('b',{},'invalid')
     def test_outbox_state_event_rollback_together(self):
@@ -204,8 +320,17 @@ class ReliabilityTests(unittest.TestCase):
         with self.assertRaises(ValueError): worker.consume('END 1')
         with self.assertRaises(ValueError): worker.consume('SLOT_6:PRESENT')
         worker.consume('BEGIN 1 V2')
+        worker.consume('LAYOUT 7 60')
         for i in range(6): worker.consume(f'SLOT_{i}:REMOVED')
         worker.consume('END 1'); self.assertTrue(worker.synchronized)
+    def test_presence_mask_repairs_dropped_removal(self):
+        self.insert(); worker=SerialWorker('fake',1,self.state,threading.Event())
+        worker.synchronized=True
+        worker.consume('PONG 0')
+        self.clock.advance(3.1); self.state.tick()
+        ref=Reference(); self.q.process(ref)
+        self.assertEqual(len(ref.data['Cycles']),1)
+        self.assertTrue(next(iter(ref.data['Cycles'].values()))['endTimeEstimated'])
     def test_immediate_ack_survives(self):
         worker=SerialWorker('fake',1,self.state,threading.Event())
         worker.send=lambda command: (worker.consume('ACK '+command.split()[1]) or True)
@@ -218,7 +343,7 @@ class ReliabilityTests(unittest.TestCase):
         with self.assertRaises(ValueError): RFIDReader([],self.state,threading.Event())
     def test_recommendation_conservative(self):
         self.insert(); slots=self.state.snapshot()
-        metadata={'1234567890':{'cache':{'latestMatchScore':90,'latestMatchConfidence':.45,'latestVoltageAt':datetime.fromtimestamp(self.clock.now(),timezone.utc).isoformat()}}}
+        metadata={'1234567890':{'id':'1234567890','name':'Blue','brand':'MK','purchaseDate':'2026-01-01','cache':{'latestMatchScore':90,'latestMatchConfidence':.45,'latestVoltageAt':datetime.fromtimestamp(self.clock.now(),timezone.utc).isoformat()}}}
         self.assertEqual(pick_next(slots,metadata,{'minTime':0},self.clock.now()),0)
         self.assertIsNone(pick_next(slots,metadata,{},self.clock.now()))
         metadata['1234567890']['retirementDate']='2026-10-01'
@@ -277,6 +402,25 @@ class ReliabilityTests(unittest.TestCase):
     def test_lease_loss_refuses_publication(self):
         ref=Reference({'Batteries':{'b':{'id':'b'}}})
         with self.assertRaises(RuntimeError): recompute_battery(ref,'b',self.config,self.now,before_publish=lambda:False)
+    def test_input_cache_refreshes_on_revision_without_repeated_history_downloads(self):
+        source={'Batteries':{'b':{'id':'b'}},'ScoringRevisions':{'b':1}}
+        cache={}; ref=Reference(source)
+        recompute_all(ref,self.config,input_cache=cache)
+        first=cache['b']['inputs']
+        recompute_all(ref,self.config,input_cache=cache)
+        self.assertIs(cache['b']['inputs'],first)
+        source['ScoringRevisions']['b']=2
+        recompute_all(ref,self.config,input_cache=cache)
+        self.assertIsNot(cache['b']['inputs'],first)
+    def test_legacy_migration_is_additive_and_idempotent(self):
+        exported={'BatteryList':{'1234567890':{'ChargingRecords':[{'StartTime':'2026-01-01 12:00:00','EndTime':'2026-01-01 13:00:00'}]}}}
+        patch,warnings=migration_plan(exported)
+        self.assertTrue(warnings); self.assertFalse(patch)
+        patch,warnings=migration_plan(exported,'America/Chicago')
+        self.assertFalse(warnings); self.assertTrue(patch)
+        ref=Reference(copy.deepcopy(exported)); ref.update(patch)
+        repeated,_=migration_plan(ref.data,'America/Chicago'); self.assertFalse(repeated)
+        self.assertEqual(ref.data['BatteryList'],exported['BatteryList'])
     def test_stale_heartbeat_does_not_mean_removed(self):
         self.assertTrue(heartbeat_online(self.now.isoformat(),self.now))
         self.assertFalse(heartbeat_online((self.now-timedelta(seconds=31)).isoformat(),self.now))

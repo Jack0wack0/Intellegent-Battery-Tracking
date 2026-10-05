@@ -129,6 +129,7 @@ class CartState:
             with self.journal.transaction():
                 self.sessions[str(slot)] = session
                 self._save()
+                self.journal.put_record('enrollment_requests', tag, {'batteryId': tag})
                 self.journal.enqueue("", patch, event_id=identity + "_start")
             self.verified.add(slot)
             self.started_monotonic[identity] = self.monotonic()
@@ -153,6 +154,7 @@ class CartState:
                   "LastOverallChargeTime": duration, "LastCycleId": identity}
         patch = {f"BatteryList/{tag}/{k}": v for k, v in values.items()}
         patch.update({f"Cycles/{identity}/{k}": v for k, v in cycle.items()})
+        patch[f"ScoringRevisions/{tag}"] = {".sv": {"increment": 1}}
         patch[f"ChargeSessions/{identity}/endTime"] = utc(end)
         # Upload-ack crash replay must not overwrite later kiosk acknowledgment fields.
         patch.update({f"PullRequests/{identity}/{k}": v for k, v in {**cycle, "cycleId": identity}.items()})
@@ -164,6 +166,8 @@ class CartState:
             with self.journal.transaction():
                 del self.sessions[str(slot)]
                 self._save()
+                self.journal.put_record('cycles', identity, cycle)
+                self.journal.put_record('pull_requests', identity, {**cycle, 'cycleId': identity})
                 self.journal.enqueue("", patch, event_id=identity + "_end")
             self.verified.discard(slot)
             self.started_monotonic.pop(identity, None)
@@ -192,6 +196,8 @@ def pick_next(slots, metadata, settings, now):
             continue
         battery = metadata.get(session["batteryId"])
         if not isinstance(battery, dict) or battery.get("retirementDate") or battery.get("status", "competition-ready") != "competition-ready":
+            continue
+        if not all(isinstance(battery.get(key), str) and battery[key].strip() for key in ('id', 'name', 'brand', 'purchaseDate')):
             continue
         cache = battery.get("cache") or {}
         score, confidence = cache.get("latestMatchScore"), cache.get("latestMatchConfidence")

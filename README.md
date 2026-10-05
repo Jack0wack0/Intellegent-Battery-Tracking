@@ -1,3 +1,10 @@
+# Intelligent Battery Tracking
+
+Competition hardening is on `fix/competition-readiness`, with the matching BatteryTrackingWebsite
+release. Read [Shared/competition_release.md](Shared/competition_release.md) for the coordinated
+migration, validated checks and required physical/deployed sign-off. The historical audit remains
+under `audit/`; its failures describe the pre-fix source revision.
+
 Intellegent-Battery-Tracking — high-level overview
 
 This repository collects the pieces for an intelligent battery tracking system. The project is split into three machine-focused components to make deployment and maintenance easier:

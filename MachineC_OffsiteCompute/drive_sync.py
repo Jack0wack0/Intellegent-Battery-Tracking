@@ -35,7 +35,7 @@ def _escape(value):
 
 
 def _list(service, query, fields):
-    items, token = [], None
+    items, token, seen = [], None, set()
     while True:
         kwargs = dict(q=query, spaces='drive', fields=f'nextPageToken,files({fields})', pageSize=1000)
         if token:
@@ -45,6 +45,9 @@ def _list(service, query, fields):
         token = result.get('nextPageToken')
         if not token:
             return items
+        if token in seen:
+            raise ValueError('Drive returned a repeated pagination token')
+        seen.add(token)
 
 
 def get_folder_id_by_name(service, folder_name):

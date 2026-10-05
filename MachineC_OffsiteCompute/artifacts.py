@@ -49,7 +49,15 @@ def atomic_output(path, mode='w', **kwargs):
 
 
 def copy_verified(source, destination):
-    with atomic_output(destination, 'wb') as output, open(source, 'rb') as input_file:
+    expected = digest(source)
+    with atomic_output(destination, 'w+b') as output, open(source, 'rb') as input_file:
         shutil.copyfileobj(input_file, output)
-    if digest(source) != digest(destination):
+        output.flush()
+        output.seek(0)
+        checksum = hashlib.sha256()
+        for chunk in iter(lambda: output.read(1024 * 1024), b''):
+            checksum.update(chunk)
+        if checksum.hexdigest() != expected:
+            raise OSError('Temporary copy checksum mismatch; previous output preserved')
+    if expected != digest(destination):
         raise OSError('Artifact checksum mismatch')

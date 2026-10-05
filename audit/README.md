@@ -1,3 +1,8 @@
+> Historical audit of commit `356971d`. The implementation branch has a new regression suite
+> under `tests/`; see `Shared/competition_release.md` for current behavior and acceptance.
+> The old reproduction harness depends on functions removed by the repair and should be run
+> against the audited revision, not used as the current release test command.
+
 # Reliability and release-readiness audit
 
 Date: October 5, 2026. Audited source: `356971d28bd8bbdd45c00bcc6923067df1456e43`.

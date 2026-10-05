@@ -33,6 +33,9 @@ class SerialWorker(threading.Thread):
         self.synchronized = False
         self.generation = 0
         self.snapshot = None
+        self.outage_reported = False
+        self.layout_seen = False
+        self.led_confirmed = False
 
     @property
     def healthy(self):
@@ -62,12 +65,14 @@ class SerialWorker(threading.Thread):
 
     def consume(self, line):
         if line == f"BEGIN {self.board} V2":
+            self.state.disconnect(self.board)
             self.synchronized = False
             self.snapshot = {}
+            self.layout_seen = False
             return
         if line == f"END {self.board}" and self.snapshot is not None:
             expected = set(range((self.board - 1) * 6, self.board * 6))
-            if set(self.snapshot) != expected:
+            if set(self.snapshot) != expected or (self.board == 1 and not self.layout_seen):
                 raise ValueError("Incomplete board snapshot")
             for slot, present in self.snapshot.items():
                 if slot < self.state.slot_count:
@@ -76,9 +81,28 @@ class SerialWorker(threading.Thread):
             self.synchronized = True
             self.last_response = time.monotonic()
             self.generation += 1
+            self.outage_reported = False
             return
-        if line == "PONG":
+        pong = re.fullmatch(r'PONG (\d+)', line)
+        if pong:
+            mask = int(pong[1])
+            if not 0 <= mask <= 63:
+                raise ValueError('Invalid board presence mask')
+            if self.synchronized:
+                current = self.state.snapshot()
+                for slot in range((self.board - 1) * 6, min(self.board * 6, self.state.slot_count)):
+                    present = bool(mask & (1 << (slot % 6)))
+                    if current[slot]['present'] != present:
+                        self.state.presence(slot, present, snapshot=True)
             self.last_response = time.monotonic()
+            return
+        layout = re.fullmatch(r"LAYOUT (\d+) (\d+)", line)
+        if layout and self.board == 1:
+            if int(layout[1]) < self.state.slot_count or int(layout[2]) < 54:
+                self.snapshot = None
+                self.synchronized = False
+                raise ValueError('Firmware LED layout is smaller than the configured cart')
+            self.layout_seen = True
             return
         ack = re.fullmatch(r"ACK ([a-f0-9]{12})", line)
         if ack:
@@ -134,6 +158,11 @@ class SerialWorker(threading.Thread):
                         raise OSError("Board response timeout")
             except Exception:
                 log.warning("Board %s unavailable; reopening", self.board, exc_info=True)
+                if not self.outage_reported:
+                    self.state.journal.enqueue(f"status/CriticalErrors/{uuid.uuid4().hex}",
+                                               {"source": f"arduino-{self.board}", "message": "Board disconnected or not responding; slot identities need verification after recovery.",
+                                                "timestamp": utc(time.time()), "acknowledged": False, "severity": "critical"}, operation='set')
+                    self.outage_reported = True
             finally:
                 self.state.disconnect(self.board)
                 self.synchronized = False
@@ -218,7 +247,7 @@ def cloud_loop(journal, stop, shared):
                     firebase_admin.initialize_app(credentials.Certificate(os.environ["FIREBASE_CREDS_FILE"]),
                                                   {"databaseURL": os.environ["FIREBASE_DB_BASE_URL"], "httpTimeout": 5})
                 root = db.reference("/")
-            journal.process(root)
+            journal.process(root, stop=stop)
             # Fresh reads needed for recommendation eligibility. Outage clears eligibility.
             settings, metadata = root.child("Settings").get(), root.child("Batteries").get()
             with shared["lock"]:
@@ -226,6 +255,8 @@ def cloud_loop(journal, stop, shared):
             if isinstance(settings, dict) and isinstance(metadata, dict):
                 journal.set_state("last_known_settings", settings)
                 journal.set_state("last_known_metadata", metadata)
+            from local_kiosk import KioskStore
+            KioskStore(journal, None).reconcile(root)
         except Exception:
             log.warning("Cloud unavailable; collecting locally", exc_info=True)
             with shared["lock"]:
@@ -235,6 +266,7 @@ def cloud_loop(journal, stop, shared):
 
 def led_loop(state, ports, reader, stop, shared):
     last_sent, generation = {}, -1
+    refreshed, error_reported = 0.0, False
     positions = [3, 11, 18, 26, 34, 42, 49, 57, 65, 73, 81, 89]
     while not stop.wait(.2):
         slots = state.snapshot()
@@ -246,7 +278,10 @@ def led_loop(state, ports, reader, stop, shared):
         if ports[0].generation != generation:
             last_sent.clear()
             generation = ports[0].generation
+            ports[0].led_confirmed = False
         if ports[0].healthy:
+            refresh = time.monotonic() - refreshed >= 3
+            confirmed = True
             for slot, entry in slots.items():
                 if entry["present"] is None:
                     mode, hue = "FLASH", 200
@@ -259,8 +294,20 @@ def led_loop(state, ports, reader, stop, shared):
                 else:
                     mode, hue = "SOLID", 0
                 command = f"SEG {slot} POS {positions[slot]} COLOR {hue} MODE {mode}"
-                if last_sent.get(slot) != command and ports[0].command(command):
-                    last_sent[slot] = command
+                if last_sent.get(slot) != command or refresh:
+                    if ports[0].command(command):
+                        last_sent[slot] = command
+                    else:
+                        confirmed = False
+            ports[0].led_confirmed = confirmed
+            if confirmed:
+                refreshed = time.monotonic()
+                error_reported = False
+            elif not error_reported:
+                state.journal.enqueue(f'status/CriticalErrors/{uuid.uuid4().hex}',
+                                      {'source': 'led', 'message': 'LED commands not acknowledged; recommendation withheld.',
+                                       'timestamp': utc(time.time()), 'severity': 'critical', 'acknowledged': False}, operation='set')
+                error_reported = True
 
 
 def main():
@@ -268,7 +315,11 @@ def main():
     root = Path(__file__).resolve().parent
     load_dotenv(root / ".env")
     directory = Path(os.environ.get("STATE_DIRECTORY", root / "state"))
+    os.umask(0o077)
     directory.mkdir(parents=True, exist_ok=True)
+    import fcntl
+    process_lock = open(directory / 'collector.lock', 'a')
+    fcntl.flock(process_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     log.addHandler(RotatingFileHandler(directory / "cart.log", maxBytes=2_000_000, backupCount=3))
     config = json.loads((root / "hardwareIDS.json").read_text())
@@ -280,7 +331,10 @@ def main():
     ports = [SerialWorker(config[f"COM_PORT{i}"], i, state, stop) for i in (1, 2)]
     reader = RFIDReader([p.strip() for p in os.environ.get("RFID_DEVICES", "").split(",") if p.strip()], state, stop)
     shared = {"lock": threading.Lock(), "settings": None, "metadata": None, "fetched": 0}
+    from local_kiosk import server
+    kiosk = server(journal, state, int(os.environ.get('KIOSK_PORT', '8765')))
     workers = ports + [reader, threading.Thread(target=cloud_loop, args=(journal, stop, shared), name="cloud", daemon=True)]
+    workers.append(threading.Thread(target=kiosk.serve_forever, name='local-kiosk', daemon=True))
     workers.append(threading.Thread(target=led_loop, args=(state, ports, reader, stop, shared), name='leds', daemon=True))
     for worker in workers:
         worker.start()
@@ -294,12 +348,18 @@ def main():
             with shared['lock']:
                 eligible = time.monotonic() - shared['fetched'] < 10
                 next_slot = pick_next(slots, shared['metadata'], shared['settings'], time.time()) if eligible else None
-            if not all(p.healthy for p in ports) or not reader.connected:
+            if not all(p.healthy for p in ports) or not reader.connected or not ports[0].led_confirmed:
                 next_slot = None
             if time.monotonic() - heartbeat >= 5:
+                try:
+                    cpu_temp = round(float(Path('/sys/class/thermal/thermal_zone0/temp').read_text()) / 1000, 1)
+                except (OSError, ValueError):
+                    cpu_temp = None
                 values = {"COM_PORT1": "connected" if ports[0].healthy else "disconnected",
                           "COM_PORT2": "connected" if ports[1].healthy else "disconnected",
                           "RFID": "connected" if reader.connected else "disconnected",
+                          "LED": "confirmed" if ports[0].led_confirmed and ports[0].healthy else "unconfirmed",
+                          "CPU_Temp": cpu_temp,
                           "LastUpdated": utc(time.time()), "ProtocolVersion": 2,
                           "PendingEvents": journal.size(), "Slots": {str(s): e for s, e in slots.items()}}
                 journal.enqueue("status", values, coalesce_key="heartbeat")
@@ -309,9 +369,13 @@ def main():
                 heartbeat = time.monotonic()
     finally:
         stop.set()
+        kiosk.shutdown()
+        kiosk.server_close()
         for worker in workers:
             worker.join(timeout=7)
-        journal.close()
+        if not any(worker.is_alive() for worker in workers):
+            journal.close()
+        process_lock.close()
 
 
 if __name__ == "__main__":

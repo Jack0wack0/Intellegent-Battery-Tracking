@@ -43,6 +43,17 @@ def validate_config(config):
     for key in ("baseline_sample_size", "recent_sample_size", "min_points_for_trend"):
         if type(config["health_score"][key]) is not int or config["health_score"][key] < 1:
             raise ValueError("Trend sizes must be positive integers")
+    ranges = [(config['match_score']['internal_resistance_range_milliohm'], 'good', 'bad'),
+              (config['health_score']['internal_resistance_change_range_pct'], 'good', 'bad'),
+              (config['health_score']['voltage_18a_change_range_pct'], 'bad', 'good'),
+              (config['health_score']['capacity_soh_range_pct'], 'bad', 'good'),
+              (config['health_score']['age_days_range'], 'full_score', 'zero_score'),
+              (config['health_score']['cycles_range'], 'full_score', 'zero_score')]
+    if any(values[low] >= values[high] for values, low, high in ranges):
+        raise ValueError('Good/bad normalization ranges have the wrong direction')
+    health = config['health_score']
+    if not 0 <= health.get('cba_full_weight_days', 180) < health.get('cba_zero_weight_days', 540):
+        raise ValueError('CBA freshness thresholds must increase')
 
 
 CURRENT_VERSION = 2

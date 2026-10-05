@@ -6,6 +6,7 @@ import logging
 import os
 from pathlib import Path
 import sqlite3
+import shutil
 from artifacts import atomic_output, copy_verified, digest, safe_path
 from drive_sync import get_service, get_folder_id_by_name, list_new_files, download_file
 from DSConverter import convert_file
@@ -42,6 +43,10 @@ class Pipeline:
         self.db.execute('INSERT OR REPLACE INTO files VALUES(?,?,?,?)', (identity, json.dumps(file), 'pending', None))
         self.db.commit()
         extension = '.dsevents' if file['name'].lower().endswith('.dsevents') else '.dslog'
+        reserve = int(os.getenv('MIN_STORAGE_FREE_BYTES', '104857600'))
+        required = max(reserve, int(file.get('size') or 0) * 8)
+        if min(shutil.disk_usage(self.staging).free, shutil.disk_usage(self.storage).free) < required:
+            raise OSError('Insufficient storage headroom; no raw history will be deleted automatically')
         raw = safe_path(self.staging, identity + extension)
         if not raw.exists() or (file.get('md5Checksum') and digest(raw, 'md5') != file['md5Checksum']):
             download_file(service, file['id'], raw, metadata=file)
@@ -67,6 +72,9 @@ class Pipeline:
         # Commit completion only when every persistent artifact has been verified.
         self.db.execute('UPDATE files SET status=?,manifest=? WHERE revision=?', ('complete', json.dumps(manifest), identity))
         self.db.commit()
+        # Persistent verified copies are authoritative; staging should not fill indefinitely.
+        for source in outputs:
+            source.unlink()
         return identity
 
     def bind(self, files):

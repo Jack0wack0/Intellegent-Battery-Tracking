@@ -29,6 +29,8 @@ class LocalQueue:
               path TEXT NOT NULL, operation TEXT NOT NULL, payload TEXT NOT NULL,
               created REAL NOT NULL, coalesce_key TEXT);
             CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS records (bucket TEXT NOT NULL, id TEXT NOT NULL,
+                payload TEXT NOT NULL, PRIMARY KEY(bucket,id));
         """)
         if legacy.exists() and not self.get_state("legacy_imported", False):
             items = json.loads(legacy.read_text())
@@ -56,7 +58,7 @@ class LocalQueue:
                 raise
 
     def enqueue(self, path, data, operation="update", *, event_id=None, coalesce_key=None):
-        if operation not in {"update", "set", "delete"}:
+        if operation not in {"update", "set", "delete", "observation", "enrollment"}:
             raise ValueError("Unsupported outbox operation")
         if operation == "update" and not isinstance(data, dict):
             raise ValueError("Firebase update requires a mapping")
@@ -80,17 +82,59 @@ class LocalQueue:
             row = self.connection.execute("SELECT payload FROM state WHERE key=?", (key,)).fetchone()
             return json.loads(row[0]) if row else default
 
-    def process(self, firebase_ref, logger=None, limit=100):
+    def put_record(self, bucket, identity, value):
+        with self.transaction():
+            self.connection.execute('INSERT OR REPLACE INTO records VALUES(?,?,?)',
+                                    (bucket, identity, json.dumps(value, allow_nan=False)))
+
+    def records(self, bucket):
+        with self.lock:
+            return {identity: json.loads(value) for identity, value in self.connection.execute(
+                'SELECT id,payload FROM records WHERE bucket=?', (bucket,))}
+
+    def pending_pulls(self):
+        with self.lock:
+            rows = self.connection.execute('''SELECT r.id,r.payload FROM records r
+                WHERE r.bucket='pull_requests' AND NOT EXISTS
+                (SELECT 1 FROM records m WHERE m.bucket='pull_measurements' AND m.id=r.id)''')
+            return {identity: json.loads(value) for identity, value in rows}
+
+    def upload_observation(self, root, value):
+        path, record = value['path'], value['record']
+        saved = root.child(path).transaction(lambda existing: existing if existing is not None else record)
+        fields = ('capacityAh', 'season', 'notes') if value['kind'] == 'cba' else (
+            'currentVoltage', 'socPercent', 'internalResistanceMilliOhm', 'voltage1A', 'voltage18A')
+        if not isinstance(saved, dict) or any(saved.get(field) != record.get(field) for field in fields):
+            self.put_record('conflicts', value['id'], {**value, 'serverRecord': saved})
+            return  # Preserve competing raw inputs; never overwrite server history.
+        if value['kind'] == 'pull':
+            cycle = record['cycleId']
+            root.child(f'Cycles/{cycle}/pullMeasurementId').transaction(lambda existing: existing or value['id'])
+            root.child(f'PullRequests/{cycle}/submittedAt').transaction(lambda existing: existing or record['timestamp'])
+        root.child(f"ScoringRevisions/{value['batteryId']}").transaction(lambda current: (current or 0) + 1)
+
+    def process(self, firebase_ref, logger=None, limit=100, stop=None):
         processed = 0
         with self.consumer:
             with self.lock:
                 rows = self.connection.execute(
                     "SELECT seq,path,operation,payload FROM outbox ORDER BY seq LIMIT ?", (limit,)).fetchall()
             for seq, path, operation, payload in rows:
+                if stop is not None and stop.is_set():
+                    break
                 try:
                     target = firebase_ref.child(path) if path else firebase_ref
                     if operation == "delete":
                         target.delete()
+                    elif operation == 'observation':
+                        self.upload_observation(firebase_ref, json.loads(payload))
+                    elif operation == 'enrollment':
+                        value = json.loads(payload)
+                        saved = firebase_ref.child(f"Batteries/{value['id']}").transaction(
+                            lambda existing: existing if isinstance(existing, dict) and all(existing.get(k) for k in ('id','name','brand','purchaseDate')) else {**(existing or {}), **value})
+                        firebase_ref.child(f"BatteryNames/{value['id']}").update({'id': value['id'], 'name': saved['name']})
+                        firebase_ref.child(f"ScoringRevisions/{value['id']}").transaction(lambda current: (current or 0) + 1)
+                        self.set_state('last_known_metadata', {**self.get_state('last_known_metadata', {}), value['id']: saved})
                     else:
                         getattr(target, operation)(json.loads(payload))
                 except Exception:

@@ -18,14 +18,22 @@ from .models import PullMeasurement, CBATest
 log = logging.getLogger("scoring")
 
 
-def recompute_battery(root_ref, battery_id, config, now=None, before_publish=lambda: True):
+def recompute_battery(root_ref, battery_id, config, now=None, before_publish=lambda: True, inputs=None, battery_data=None):
     now = now or datetime.now(timezone.utc)
-    battery = store.get_battery(root_ref, battery_id)
-    raw_measurements = root_ref.child(store.MEASUREMENTS_PATH).child(battery_id).get() or {}
-    raw_tests = root_ref.child(store.CBA_PATH).child(battery_id).get() or {}
+    from .models import Battery
+    battery = Battery.from_dict(battery_id, battery_data) if battery_data is not None else store.get_battery(root_ref, battery_id)
+    if inputs is None:
+        inputs = {}
+    if not inputs:
+        inputs.update(raw_measurements=root_ref.child(store.MEASUREMENTS_PATH).child(battery_id).get() or {},
+                      raw_tests=root_ref.child(store.CBA_PATH).child(battery_id).get() or {},
+                      cycles=store.get_cycles(root_ref, battery_id))
+    raw_measurements, raw_tests = inputs['raw_measurements'], inputs['raw_tests']
     measurements, warnings = store.parse_records(raw_measurements, battery_id, PullMeasurement, now)
     cba_tests, cba_warnings = store.parse_records(raw_tests, battery_id, CBATest, now)
-    cycles = store.get_cycles(root_ref, battery_id)
+    cycles = inputs['cycles']
+    warnings += [f"Cycle {identity}: timestamp estimated or affected by clock change" for identity, cycle in cycles.items()
+                 if cycle.get('clockAnomaly') or cycle.get('endTimeEstimated')]
     latest = measurements[-1] if measurements else None
     match = compute_match_score(latest, config, now=now, history=measurements) if latest else None
     health = compute_health_score(battery, measurements, cba_tests, len(cycles), config, now=now)
@@ -77,11 +85,23 @@ def recompute_battery(root_ref, battery_id, config, now=None, before_publish=lam
     return snapshot, cache
 
 
-def recompute_all(root_ref, config, before_publish=lambda: True):
+def recompute_all(root_ref, config, before_publish=lambda: True, input_cache=None):
     failures = []
-    for identity in store.list_battery_ids(root_ref):
+    batteries = root_ref.child(store.BATTERIES_PATH).get() or {}
+    revisions = root_ref.child('ScoringRevisions').get() or {}
+    if not isinstance(batteries, dict) or not isinstance(revisions, dict):
+        raise ValueError('Invalid battery/revision collection')
+    for identity, battery_data in batteries.items():
         try:
-            recompute_battery(root_ref, identity, config, before_publish=before_publish)
+            entry = input_cache.get(identity) if input_cache is not None else None
+            metadata = {k: v for k, v in battery_data.items() if k != 'cache'}
+            refresh = entry is None or entry['revision'] != revisions.get(identity) or entry['metadata'] != metadata or time.monotonic() - entry['readAt'] >= 600
+            if refresh:
+                entry = {'inputs': {}, 'revision': revisions.get(identity), 'metadata': metadata, 'readAt': time.monotonic()}
+            recompute_battery(root_ref, identity, config, before_publish=before_publish,
+                              inputs=entry['inputs'], battery_data=battery_data)
+            if input_cache is not None:
+                input_cache[identity] = entry
         except Exception:
             failures.append(identity)
             log.exception('Battery %s failed; retrying next reconciliation', identity)
@@ -113,13 +133,13 @@ def main():
                                   {'databaseURL': os.environ['FIREBASE_DB_BASE_URL'], 'httpTimeout': 10})
     root = db.reference('/')
     config, stop = load_config(CURRENT_VERSION), threading.Event()
-    lease = WriterLease(root)
+    lease, input_cache = WriterLease(root), {}
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
     while not stop.is_set():
         try:
             if lease.renew():
-                failures = recompute_all(root, config, before_publish=lease.renew)
+                failures = recompute_all(root, config, before_publish=lease.renew, input_cache=input_cache)
                 root.child('status/Scoring').update({'LastUpdated': datetime.now(timezone.utc).isoformat(),
                                                     'AlgorithmVersion': config['version'], 'FailedBatteryIds': failures})
         except Exception:

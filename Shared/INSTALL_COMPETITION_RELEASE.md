@@ -1,5 +1,8 @@
 # Competition release: changes and installation
 
+**No Arduino reflash available:** use [COMPETITION_TEAM_COMMANDS.md](COMPETITION_TEAM_COMMANDS.md)
+and the Python legacy-compatibility fix instead of the protocol-v2 board upgrade below.
+
 Use this guide for the coordinated `fix/competition-readiness` release. It covers the Pi,
 two Arduino UNO boards, offsite Linux computer and BatteryTrackingWebsite. Allow a maintenance
 window: the old collector cannot operate the new firmware correctly, and the website/rules must

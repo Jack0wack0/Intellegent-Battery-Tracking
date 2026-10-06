@@ -200,6 +200,57 @@ class ReliabilityTests(unittest.TestCase):
         source=self.root/'corrupt.sqlite3'; source.write_bytes(b'not a database')
         with self.assertRaises(sqlite3.DatabaseError): LocalQueue(source)
         self.assertEqual(source.read_bytes(),b'not a database')
+    def test_legacy_cart_tracks_pull_without_firmware_snapshot_or_ack(self):
+        worker=SerialWorker('fake',1,self.state,threading.Event(),protocol='legacy')
+        worker.consume('SLOT_0:REMOVED')
+        self.state.scan('1234567890'); worker.consume('SLOT_0:PRESENT')
+        self.clock.advance(1.1); self.state.tick()
+        worker.consume('SLOT_0:REMOVED'); self.clock.advance(4); self.state.tick()
+        self.assertEqual(len(self.q.records('cycles')),1)
+        self.assertEqual(len(self.q.pending_pulls()),1)
+        self.assertFalse(worker.healthy)
+        self.assertIsNone(self.state.snapshot()[1]['present'])
+        with self.assertRaises(ValueError): worker.consume('SLOT_6:PRESENT')
+
+    def test_legacy_leds_use_bare_commands_and_never_confirm_green_pick(self):
+        from types import SimpleNamespace
+        class Stop:
+            calls=0
+            def wait(self,_): self.calls+=1; return self.calls>1
+        class Port:
+            def __init__(self): self.writes=[]
+            def write(self,value): self.writes.append(value); return len(value)
+        stop=threading.Event()
+        board=SerialWorker('fake',1,self.state,stop,protocol='legacy'); board.port=Port()
+        board.consume('PONG'); board.consume('ACK')
+        other=SerialWorker('fake',2,self.state,stop,protocol='legacy')
+        with patch('input_listener.pick_next',return_value=0):
+            led_loop(self.state,[board,other],SimpleNamespace(connected=True),Stop(),
+                     {'lock':threading.Lock(),'fetched':__import__('time').monotonic(),'metadata':{},'settings':{}})
+        self.assertEqual(len(board.port.writes),7)
+        self.assertTrue(all(value.startswith(b'SEG ') for value in board.port.writes))
+        self.assertFalse(any(b'DEEPPULSE' in value for value in board.port.writes))
+        self.assertFalse(board.led_confirmed)
+        board.consume('Ready. Commands:'); self.assertFalse(board.legacy_ready)
+
+    def test_silent_legacy_board_two_stays_open_without_fake_timeout(self):
+        stop=threading.Event(); opened=[]
+        class Port:
+            reads=0
+            def __init__(self): self.writes=[]
+            def write(self,value): self.writes.append(value)
+            def read_until(self,*args,**kwargs):
+                self.reads+=1
+                if self.reads>=3: stop.set()
+                return b''
+            def close(self): pass
+        port=Port()
+        def factory(*args,**kwargs): opened.append(True); return port
+        worker=SerialWorker('fake',2,self.state,stop,serial_factory=factory,protocol='legacy')
+        with patch('input_listener.time.monotonic',side_effect=lambda:100+port.reads*20): worker.run()
+        self.assertEqual(len(opened),1); self.assertEqual(port.writes,[])
+        self.assertFalse(worker.healthy)
+
     def test_serial_reader_reopens_after_unplug(self):
         stop=threading.Event(); opened=[]
         class Port:

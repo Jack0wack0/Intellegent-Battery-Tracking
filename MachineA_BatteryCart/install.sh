@@ -14,9 +14,11 @@ if [[ ! -f .env ]]; then
   read -r -p 'Firebase database URL: ' TASK_URL
   read -r -p 'Absolute service account JSON path: ' TASK_CREDS
   read -r -p 'Dedicated RFID /dev/input/by-id/*event-kbd paths (comma separated; scanners only): ' TASK_RFID
+  read -r -p 'Arduino firmware protocol: legacy (no reflash) or v2 [legacy]: ' TASK_PROTOCOL
+  TASK_PROTOCOL=${TASK_PROTOCOL:-legacy}
   [[ -n "$TASK_URL" && "$TASK_CREDS" == /* && -f "$TASK_CREDS" && -n "$TASK_RFID" ]] || exit 1
   umask 077
-  printf 'FIREBASE_DB_BASE_URL=%s\nFIREBASE_CREDS_FILE=%s\nRFID_DEVICES=%s\nSLOT_COUNT=7\n' "$TASK_URL" "$TASK_CREDS" "$TASK_RFID" > .env
+  printf 'FIREBASE_DB_BASE_URL=%s\nFIREBASE_CREDS_FILE=%s\nRFID_DEVICES=%s\nARDUINO_PROTOCOL=%s\nSLOT_COUNT=7\n' "$TASK_URL" "$TASK_CREDS" "$TASK_RFID" "$TASK_PROTOCOL" > .env
 fi
 if [[ ! -f hardwareIDS.json ]]; then
   read -r -p 'Board 1 stable /dev/serial/by-id path: ' TASK_PORT1
@@ -35,6 +37,10 @@ from dotenv import dotenv_values
 from pathlib import Path
 import glob, json
 c=dotenv_values('.env')
+protocol=c.get('ARDUINO_PROTOCOL','v2')
+if protocol not in ('legacy','v2'): raise SystemExit('ARDUINO_PROTOCOL must be legacy or v2')
+if protocol=='legacy' and not 1 <= int(c.get('SLOT_COUNT','7')) <= 7:
+    raise SystemExit('Legacy firmware requires SLOT_COUNT between 1 and 7')
 for key in ('FIREBASE_DB_BASE_URL','FIREBASE_CREDS_FILE','RFID_DEVICES'):
     if not c.get(key): raise SystemExit(f'Missing {key} in .env')
 if not Path(c['FIREBASE_CREDS_FILE']).is_file(): raise SystemExit('Credential file missing')
@@ -81,4 +87,4 @@ sudo systemctl restart tagtracker.service
 sleep 2
 sudo systemctl is-active --quiet tagtracker.service
 printf 'Cart service started. Verify RFID capture and both board snapshots in journalctl -u tagtracker.\n'
-printf 'Upload both protocol-v2 sketches before accepting the cart as operational.\n'
+printf 'Verify the configured Arduino firmware protocol; legacy mode requires no reflash and uses manual battery selection.\n'

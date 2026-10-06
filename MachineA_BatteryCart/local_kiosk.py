@@ -45,6 +45,7 @@ class KioskStore:
         enrollment = [tag for tag in requests if not all((metadata.get(tag) or {}).get(field) for field in ('id','name','brand','purchaseDate'))]
         return {'slots': {str(k): v for k, v in self.state.snapshot().items()}, 'batteries': metadata,
                 'enrollmentRequests': enrollment, 'pullRequests': self.journal.pending_pulls(),
+                'collectorStatus': self.journal.get_state('local_status', {}),
                 'conflicts': self.journal.records('conflicts'), 'pendingEvents': self.journal.size()}
 
     def enroll(self, data):

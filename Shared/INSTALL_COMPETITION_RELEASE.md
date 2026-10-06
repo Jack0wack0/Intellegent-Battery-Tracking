@@ -119,11 +119,43 @@ publish **only** the database rules using the website's local CLI:
 ./node_modules/.bin/firebase deploy --only database --project YOUR_PROJECT_ID
 ```
 
-Upload the generated `build/` directory through the site's existing hosting/deployment process.
-This repository does not configure a Firebase Hosting target; do not assume the database command
-publishes the website. Verify the public site loads the new build and correct database, an approved
-crew member can enroll/save measurements, and an unapproved account cannot access crew data.
-Keep the previous build/rules available. Build-time environment changes require another build.
+### Cloudflare Pages deployment
+
+The website is hosted on **Cloudflare Pages**; Firebase hosts authentication and the realtime
+database. In Cloudflare dashboard → **Workers & Pages** → the existing Pages project →
+**Settings**, check the Git build settings and build environment variables:
+
+| Setting | Value for this repository |
+| --- | --- |
+| Connected repository | `Jack0wack0/BatteryTrackingWebsite` |
+| Root directory | Repository root (leave blank unless the existing project requires an explicit root) |
+| Build command | `npm ci --include=dev && npm run build` |
+| Build output directory | `build` — this repository overrides Vite's usual `dist` output |
+| Node version | `NODE_VERSION=24.15.0` (also recorded in `.node-version`) |
+| Firebase build configuration | `REACT_APP_FIREBASE_CONFIG` containing the complete public web-config JSON |
+
+Set the Node/Firebase variables for **Production** and separately for **Preview**, as needed.
+Paste the JSON directly as the environment-variable value, without surrounding shell quotes.
+Use the same RTDB as the machines for production; use a test Firebase project for preview writes.
+Never put service-account JSON into a Pages variable or the public bundle. The explicit build
+command includes dev dependencies because Vite is needed during compilation.
+
+Keep the project's existing production branch setting. For a Git-integrated Pages project,
+allow `fix/competition-readiness` as a preview branch and inspect its deployment/build logs.
+After review, publishing the release to the configured production branch triggers its production
+build. Do not switch the production branch to the readiness branch merely to test it. For an
+existing Direct Upload project, upload the locally generated `build/` directory through that
+project's established upload workflow instead; Git integration instructions do not apply.
+
+Verify the deployed commit, public URL, sign-in and approved/unapproved access. Environment
+variables are compiled into this static app: changing them requires a new deployment/build.
+Keep the previous deployment available through Pages' deployment history for rollback. Pages
+builds do **not** deploy Firebase database rules; run the separate database command above during
+the coordinated release.
+
+Reference: [Pages build configuration](https://developers.cloudflare.com/pages/configuration/build-configuration/),
+[Node/build image overrides](https://developers.cloudflare.com/pages/configuration/build-image/) and
+[preview deployments](https://developers.cloudflare.com/pages/configuration/preview-deployments/).
 
 ## 4. Upload both Arduino boards
 

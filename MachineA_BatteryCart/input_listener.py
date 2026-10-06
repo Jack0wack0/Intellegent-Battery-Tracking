@@ -21,10 +21,15 @@ log = logging.getLogger("cart")
 
 
 class SerialWorker(threading.Thread):
-    def __init__(self, path, board, state, stop, serial_factory=None):
+    def __init__(self, path, board, state, stop, serial_factory=None, protocol='v2'):
         super().__init__(name=f"board-{board}", daemon=True)
         self.path, self.board, self.state, self.stop = path, board, state, stop
         self.serial_factory = serial_factory
+        if protocol not in ('v2', 'legacy'):
+            raise ValueError('ARDUINO_PROTOCOL must be v2 or legacy')
+        if protocol == 'legacy' and state.slot_count > 7:
+            raise ValueError('Legacy firmware supports at most seven LED segments')
+        self.protocol = protocol
         self.port = None
         self.write_lock = threading.Lock()
         self.pending_lock = threading.Lock()
@@ -39,7 +44,13 @@ class SerialWorker(threading.Thread):
 
     @property
     def healthy(self):
+        if self.protocol == 'legacy':
+            return False  # Old board 2 has no heartbeat/snapshot; never authorize a pick.
         return self.port is not None and self.synchronized and time.monotonic() - self.last_response < 8
+
+    @property
+    def legacy_ready(self):
+        return self.protocol == 'legacy' and self.board == 1 and self.port is not None and self.last_response > 0 and time.monotonic() - self.last_response < 8
 
     def send(self, line):
         with self.write_lock:
@@ -53,6 +64,9 @@ class SerialWorker(threading.Thread):
                 return False
 
     def command(self, body, timeout=1.5):
+        if self.protocol == 'legacy':
+            # Bare ACK cannot identify which command succeeded; this is only a transport write.
+            return self.send(body)
         identity = uuid.uuid4().hex[:12]
         event = threading.Event()
         with self.pending_lock:
@@ -64,6 +78,25 @@ class SerialWorker(threading.Thread):
                 self.pending.pop(identity, None)
 
     def consume(self, line):
+        if self.protocol == 'legacy':
+            if line.startswith('BEGIN ') or line.startswith('LAYOUT '):
+                raise ValueError('Protocol-v2 firmware detected: configure ARDUINO_PROTOCOL=v2')
+            if line == 'Ready. Commands:' and self.board == 1:
+                self.state.disconnect(self.board)
+                self.generation += 1
+                self.last_response = 0
+            if line == 'PONG' and self.board == 1:
+                self.last_response = time.monotonic()
+                return
+            observation = re.fullmatch(r'SLOT_(\d+):(PRESENT|REMOVED)', line)
+            if observation:
+                slot = int(observation[1])
+                if not (self.board - 1) * 6 <= slot < self.board * 6:
+                    raise ValueError('Slot belongs to another board')
+                if slot < self.state.slot_count:
+                    self.state.presence(slot, observation[2] == 'PRESENT')
+                self.last_response = time.monotonic()
+            return
         if line == f"BEGIN {self.board} V2":
             self.state.disconnect(self.board)
             self.synchronized = False
@@ -135,15 +168,17 @@ class SerialWorker(threading.Thread):
                     self.port = port
                 self.synchronized = False
                 self.snapshot = None
+                self.last_response = 0
+                self.generation += 1
                 # Opening an UNO resets it; request again after boot if necessary.
                 ping_at, snapshot_at, opened = 0.0, 0.0, time.monotonic()
                 while not self.stop.is_set():
                     now = time.monotonic()
-                    if now - ping_at >= 2:
+                    if (self.protocol == 'v2' or self.board == 1) and now - ping_at >= 2:
                         if not self.send("PING"):
                             raise OSError("PING write failed")
                         ping_at = now
-                    if not self.synchronized and now - snapshot_at >= 2:
+                    if self.protocol == 'v2' and not self.synchronized and now - snapshot_at >= 2:
                         self.send("SNAPSHOT")
                         snapshot_at = now
                     raw = port.read_until(b"\n", size=128)
@@ -152,9 +187,9 @@ class SerialWorker(threading.Thread):
                             raise ValueError("Overlong/unterminated serial message")
                         try:
                             self.consume(raw.decode("ascii").strip())
-                        except (ValueError, UnicodeError):
-                            log.warning("Rejected malformed board %s message", self.board)
-                    if now - max(self.last_response, opened) > 10:
+                        except (ValueError, UnicodeError) as error:
+                            log.warning("Rejected board %s message: %s", self.board, error)
+                    if (self.protocol == 'v2' or self.board == 1) and now - max(self.last_response, opened) > 10:
                         raise OSError("Board response timeout")
             except Exception:
                 log.warning("Board %s unavailable; reopening", self.board, exc_info=True)
@@ -273,13 +308,16 @@ def led_loop(state, ports, reader, stop, shared):
         with shared['lock']:
             eligible = time.monotonic() - shared['fetched'] < 10
             next_slot = pick_next(slots, shared['metadata'], shared['settings'], time.time()) if eligible else None
+        legacy = getattr(ports[0], 'protocol', 'v2') == 'legacy'
+        if legacy:
+            next_slot = None
         if not all(p.healthy for p in ports) or not reader.connected:
             next_slot = None
         if ports[0].generation != generation:
             last_sent.clear()
             generation = ports[0].generation
             ports[0].led_confirmed = False
-        if ports[0].healthy:
+        if ports[0].healthy or (legacy and ports[0].legacy_ready):
             refresh = time.monotonic() - refreshed >= 3
             confirmed = True
             for slot, entry in slots.items():
@@ -299,7 +337,7 @@ def led_loop(state, ports, reader, stop, shared):
                         last_sent[slot] = command
                     else:
                         confirmed = False
-            ports[0].led_confirmed = confirmed
+            ports[0].led_confirmed = confirmed and not legacy
             if confirmed:
                 refreshed = time.monotonic()
                 error_reported = False
@@ -328,7 +366,10 @@ def main():
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
-    ports = [SerialWorker(config[f"COM_PORT{i}"], i, state, stop) for i in (1, 2)]
+    protocol = os.environ.get('ARDUINO_PROTOCOL', 'v2').strip().lower()
+    ports = [SerialWorker(config[f"COM_PORT{i}"], i, state, stop, protocol=protocol) for i in (1, 2)]
+    if protocol == 'legacy':
+        log.warning('LEGACY firmware mode: no automatic battery pick or confirmed LEDs; initialize slots through observed transitions and select batteries manually.')
     reader = RFIDReader([p.strip() for p in os.environ.get("RFID_DEVICES", "").split(",") if p.strip()], state, stop)
     shared = {"lock": threading.Lock(), "settings": None, "metadata": None, "fetched": 0}
     from local_kiosk import server
@@ -355,13 +396,15 @@ def main():
                     cpu_temp = round(float(Path('/sys/class/thermal/thermal_zone0/temp').read_text()) / 1000, 1)
                 except (OSError, ValueError):
                     cpu_temp = None
-                values = {"COM_PORT1": "connected" if ports[0].healthy else "disconnected",
-                          "COM_PORT2": "connected" if ports[1].healthy else "disconnected",
+                values = {"COM_PORT1": ("legacy-port-open" if ports[0].port is not None else "disconnected") if protocol == 'legacy' else ("connected" if ports[0].healthy else "disconnected"),
+                          "COM_PORT2": ("legacy-port-open" if ports[1].port is not None else "disconnected") if protocol == 'legacy' else ("connected" if ports[1].healthy else "disconnected"),
                           "RFID": "connected" if reader.connected else "disconnected",
                           "LED": "confirmed" if ports[0].led_confirmed and ports[0].healthy else "unconfirmed",
                           "CPU_Temp": cpu_temp,
-                          "LastUpdated": utc(time.time()), "ProtocolVersion": 2,
+                          "LastUpdated": utc(time.time()), "ProtocolVersion": 1 if protocol == 'legacy' else 2,
+                          "FirmwareMode": protocol, "ManualSelectionRequired": protocol == 'legacy',
                           "PendingEvents": journal.size(), "Slots": {str(s): e for s, e in slots.items()}}
+                journal.set_state('local_status', values)
                 journal.enqueue("status", values, coalesce_key="heartbeat")
                 journal.enqueue("BatteryNextUp", {"BatteryNext": slots[next_slot]["session"]["batteryId"] if next_slot is not None else None,
                                                    "Slot": next_slot, "verifiedAt": utc(time.time())},

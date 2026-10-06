@@ -1,5 +1,8 @@
 # Competition release and acceptance
 
+**No Arduino reflash available:** use [COMPETITION_TEAM_COMMANDS.md](COMPETITION_TEAM_COMMANDS.md)
+and the Python legacy-compatibility fix instead of the protocol-v2 board upgrade below.
+
 For exact setup commands and the full change summary, use [INSTALL_COMPETITION_RELEASE.md](INSTALL_COMPETITION_RELEASE.md).
 
 This is a coordinated cart + two Arduino boards + offsite scorer/ingestion + kiosk release.

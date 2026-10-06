@@ -1,5 +1,9 @@
 # Arduino firmware: protocol v2
 
+**Reflashing unavailable at competition?** Keep the existing sketches flashed and use the
+[Python legacy mode/team guide](../Shared/COMPETITION_TEAM_COMMANDS.md). The v2 sketches below
+are optional for a later coordinated upgrade, not a requirement for legacy operation.
+
 See the [coordinated change summary and detailed installation guide](../Shared/INSTALL_COMPETITION_RELEASE.md) before installing this release.
 
 The cart has seven installed slots: A0–A5 on board 1 are slots 0–5; A0 on board 2 is slot 6.

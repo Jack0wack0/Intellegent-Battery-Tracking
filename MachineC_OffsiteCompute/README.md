@@ -1,5 +1,8 @@
 # Machine C: scoring and durable Drive ingestion
 
+[Competition arrival/startup/ingestion/shutdown commands](../Shared/COMPETITION_TEAM_COMMANDS.md#d-jackson--offsite-computer-setup-and-event-day-commands).
+The offsite computer does not require Arduino reflashing.
+
 See the [coordinated change summary and detailed installation guide](../Shared/INSTALL_COMPETITION_RELEASE.md) before installing this release.
 
 Python 3.10+ on Linux, with the pinned requirements installed into a virtualenv.

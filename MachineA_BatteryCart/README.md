@@ -6,9 +6,12 @@ Runs seven slots by default: Arduino 1 supplies slots 0–5, Arduino 2 supplies 
 The dedicated RFID scanners act as USB keyboards. Scans are read using Linux evdev and
 are grabbed exclusively, so they do not depend on terminal stdin or Chromium focus.
 
-Use Raspberry Pi OS/Debian with Python 3.10+. Upload **both protocol-v2 sketches** before
-running the new collector. The older sketches do not implement initial snapshots or
-correlated command acknowledgments.
+Use Raspberry Pi OS/Debian with Python 3.10+. For competition without reflashing, follow
+[the team commands](../Shared/COMPETITION_TEAM_COMMANDS.md) and explicitly configure
+`ARDUINO_PROTOCOL=legacy`. This mode logs real transitions and local readings but leaves
+automatic picks disabled and LEDs unconfirmed. Existing slots are unknown until observed.
+For `ARDUINO_PROTOCOL=v2`, both boards must have the protocol-v2 sketches; old firmware does
+not implement snapshots or correlated command acknowledgments.
 
 ## Configure and install
 
@@ -32,6 +35,7 @@ Local `.env`:
 FIREBASE_DB_BASE_URL=https://YOUR_DATABASE.firebasedatabase.app
 FIREBASE_CREDS_FILE=/absolute/path/to/service-account.json
 RFID_DEVICES=/dev/input/by-id/SCANNER_ONE-event-kbd,/dev/input/by-id/SCANNER_TWO-event-kbd
+ARDUINO_PROTOCOL=legacy
 SLOT_COUNT=7
 ```
 

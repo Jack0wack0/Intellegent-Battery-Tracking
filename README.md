@@ -1,5 +1,8 @@
 # Intelligent Battery Tracking
 
+**Competition with existing Arduino firmware:** [Team commands — no reflash](Shared/COMPETITION_TEAM_COMMANDS.md).
+Requires the Python legacy-compatibility fix and `ARDUINO_PROTOCOL=legacy`; battery selection stays manual.
+
 **Install this release:** [Changes and detailed installation guide](Shared/INSTALL_COMPETITION_RELEASE.md)
 (Pi, both Arduino boards, offsite services, website/rules, backups and verification).
 

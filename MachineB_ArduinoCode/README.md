@@ -1,5 +1,7 @@
 # Arduino firmware: protocol v2
 
+See the [coordinated change summary and detailed installation guide](../Shared/INSTALL_COMPETITION_RELEASE.md) before installing this release.
+
 The cart has seven installed slots: A0–A5 on board 1 are slots 0–5; A0 on board 2 is slot 6.
 The remaining inputs on board 2 are ignored by the default Pi configuration. Ground unused
 inputs, use a shared ground and the LED strip's appropriate external power supply.

@@ -1,5 +1,7 @@
 # Competition release and acceptance
 
+For exact setup commands and the full change summary, use [INSTALL_COMPETITION_RELEASE.md](INSTALL_COMPETITION_RELEASE.md).
+
 This is a coordinated cart + two Arduino boards + offsite scorer/ingestion + kiosk release.
 The implementation branch fixes the audited software paths. Competition approval still requires
 the actual Linux installation, deployed Firebase/website configuration and physical acceptance below.
@@ -37,7 +39,7 @@ Use the final PR checks/evidence for counts and post-edit firmware memory number
    was present during this implementation; verify the deployed build's configuration explicitly.
    Keep service-account files private and owned by the service user. Do not commit exports/secrets.
 3. Stop cart/offsite writers for the maintenance window. Disable the old offsite auto-pull timer.
-4. Deploy the reviewed website rules/indexes and matching kiosk build. Test with an approved crew
+4. Deploy the reviewed Firebase rules/indexes and matching Cloudflare Pages kiosk build. Test with an approved crew
    account and a nonapproved account before granting readiness. The branch prepares rules/build;
    it does not authorize or perform a production deployment.
 5. Upload both v2 sketches to their correct boards. The seven-slot default drives pixels 0–59,
